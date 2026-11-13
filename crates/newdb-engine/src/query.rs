@@ -12,7 +12,7 @@ use newdb_types::header::field::{END, ERROR, INPUTS, MODEL, NAME, OUTPUTS, PAREN
 use newdb_types::text::tokens;
 use newdb_types::{
     Read, ReadStats, Result, Run, RunKey, RunQuery, RunSummary, RunType, SearchHit, SearchQuery,
-    Span, SpanHeader, Status, TraceId, TraceQuery,
+    Span, SpanHeader, SpanId, Status, TraceId, TraceQuery,
 };
 
 use crate::part::{
@@ -312,9 +312,20 @@ fn summary_run(v: &View<'_>, s: &RunSummary) -> Result<Option<Run>> {
     }))
 }
 
-/// Candidates from the `fts` postings (a span is a candidate when each query token appears
-/// in some partition's postings for it), sorted newest first by the merged span's key,
-/// then confirmed one by one against the merged `inputs` and `outputs` until `limit`.
+/// A search candidate: a span complete in one partition (`Local`, its merged header
+/// there), or a span merged across partitions (`Merged`, index into the loaded traces).
+enum Cand {
+    Local(usize, SpanHeader),
+    Merged(usize, usize),
+}
+
+/// Newest-first search, exact. A span whose trace lives in one partition matches only if
+/// that partition's postings hold every token, so it comes from the per-partition
+/// intersection and is keyed and confirmed from that partition alone. A span of a trace
+/// with posts in several partitions can match with its tokens split across them, so it
+/// becomes a candidate when any partition lists it for any token, and is merged. All
+/// candidates are sorted by key, then confirmed against the merged `inputs` and `outputs`
+/// until `limit`.
 pub(crate) fn search(views: &[View<'_>], q: &SearchQuery) -> Result<Read<Vec<SearchHit>>> {
     let mut ph = Phases::new(q.timings);
     let mut st = ReadStats::default();
@@ -322,67 +333,121 @@ pub(crate) fn search(views: &[View<'_>], q: &SearchQuery) -> Result<Read<Vec<Sea
     if want.is_empty() || q.limit == 0 {
         return Ok(done(Vec::new(), st, ph));
     }
-    let skip: Vec<bool> = views
-        .iter()
-        .map(|v| {
-            q.project
-                .as_ref()
-                .is_some_and(|p| v.strings().id(p).is_none())
-        })
-        .collect();
-    let mut cand: Option<HashSet<_>> = None;
-    for tok in &want {
-        let mut set = HashSet::new();
-        for (v, _) in views.iter().zip(&skip).filter(|(_, s)| !**s) {
+    let mut multis = HashMap::new();
+    let mut spread: HashSet<(TraceId, SpanId)> = HashSet::new();
+    let mut keyed: Vec<(Reverse<(RunKey, &str)>, Cand)> = Vec::new();
+    for (pi, v) in views.iter().enumerate() {
+        let pid = match &q.project {
+            Some(p) => match v.strings().id(p) {
+                Some(id) => Some(id),
+                None => continue,
+            },
+            None => None,
+        };
+        st.partitions_touched += 1;
+        // Every (trace, span) listed for a query token here, sorted, one entry per token.
+        let mut listed: Vec<(TraceId, SpanId)> = Vec::new();
+        for tok in &want {
             let (ps, cost) = v.postings(tok)?;
             add_cost(&mut st, cost);
-            set.extend(
-                ps.into_iter()
-                    .filter(|p| cand.as_ref().is_none_or(|c| c.contains(p))),
-            );
+            listed.extend(ps);
         }
-        let empty = set.is_empty();
-        cand = Some(set);
-        if empty {
-            break;
+        listed.sort_unstable();
+        let mut at = 0;
+        while at < listed.len() {
+            let t = listed[at].0;
+            let mut spans = Vec::new();
+            while at < listed.len() && listed[at].0 == t {
+                let s = listed[at].1;
+                let n = listed[at..]
+                    .iter()
+                    .take_while(|x| x.1 == s && x.0 == t)
+                    .count();
+                spans.push((s, n == want.len()));
+                at += n;
+            }
+            if multi(views, pi, t, &mut multis, &mut st)? {
+                spread.extend(spans.iter().map(|(s, _)| (t, *s)));
+                continue;
+            }
+            if !spans.iter().any(|(_, all)| *all) {
+                continue;
+            }
+            let (headers, cost) = v.trace(t)?;
+            add_cost(&mut st, cost);
+            for h in headers {
+                let full = spans.iter().any(|(s, all)| *all && *s == h.span_id);
+                if full && pid.is_none_or(|id| h.project == id) {
+                    let project = v
+                        .strings()
+                        .get(h.project)
+                        .ok_or_else(|| corrupt("project is not in the partition"))?;
+                    let key = RunKey {
+                        start_ns: h.start_ns,
+                        trace_id: t,
+                        span_id: h.span_id,
+                    };
+                    keyed.push((Reverse((key, project)), Cand::Local(pi, h)));
+                }
+            }
         }
     }
-    st.partitions_touched += skip.iter().filter(|s| !**s).count() as u64;
-    let cand = cand.unwrap_or_default();
     ph.mark("postings");
 
-    let mut traces: Vec<TraceId> = cand.iter().map(|(t, _)| *t).collect();
+    let mut traces: Vec<TraceId> = spread.iter().map(|(t, _)| *t).collect();
     traces.sort_unstable();
     traces.dedup();
     let mut loaded = Vec::with_capacity(traces.len());
-    let mut keyed = Vec::new();
     for t in traces {
-        let merged = load_trace(views, t, q.project.as_deref(), &mut st)?;
+        loaded.push(load_trace(views, t, q.project.as_deref(), &mut st)?);
+    }
+    for (ti, merged) in loaded.iter().enumerate() {
         for (j, m) in merged.iter().enumerate() {
-            if cand.contains(&(t, m.span.span_id)) {
+            let (t, s) = (m.span.trace_id, m.span.span_id);
+            if spread.contains(&(t, s)) {
                 let key = RunKey {
                     start_ns: m.span.start_ns.unwrap_or(0),
                     trace_id: t,
-                    span_id: m.span.span_id,
+                    span_id: s,
                 };
-                keyed.push((Reverse((key, m.span.project.clone())), loaded.len(), j));
+                keyed.push((Reverse((key, m.span.project.as_str())), Cand::Merged(ti, j)));
             }
         }
-        loaded.push(merged);
     }
-    keyed.sort_unstable();
+    keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     ph.mark("candidates");
 
     let mut hits = Vec::new();
-    for (Reverse((key, project)), ti, j) in keyed {
-        let m = &mut loaded[ti][j];
-        load_payloads(views, m, INPUTS | OUTPUTS, &mut st)?;
-        let mut have = tokens(m.span.inputs.as_deref().unwrap_or_default());
-        have.extend(tokens(m.span.outputs.as_deref().unwrap_or_default()));
-        m.span.strip_payloads();
+    for (Reverse((key, project)), cand) in &keyed {
+        let (inputs, outputs) = match cand {
+            Cand::Local(pi, h) => {
+                let b = views[*pi].blob();
+                let mut read = |bit: u32| -> Result<Option<Vec<u8>>> {
+                    if !h.has(bit) {
+                        return Ok(None);
+                    }
+                    let bytes = b.read(payload_ref(h, bit))?;
+                    st.payload_bytes_decompressed += bytes.len() as u64;
+                    Ok(Some(bytes))
+                };
+                (read(INPUTS)?, read(OUTPUTS)?)
+            }
+            Cand::Merged(ti, j) => {
+                let mut m = Merged {
+                    span: loaded[*ti][*j].span.clone(),
+                    pieces: loaded[*ti][*j].pieces.clone(),
+                    owner: 0,
+                    owner_has_start: false,
+                };
+                load_payloads(views, &mut m, INPUTS | OUTPUTS, &mut st)?;
+                (m.span.inputs, m.span.outputs)
+            }
+        };
+        let mut have = tokens(inputs.as_deref().unwrap_or_default());
+        have.extend(tokens(outputs.as_deref().unwrap_or_default()));
         if want.iter().all(|w| have.contains(w)) {
             hits.push(SearchHit {
-                project,
+                project: project.to_string(),
                 trace_id: key.trace_id,
                 span_id: key.span_id,
                 start_ns: key.start_ns,
