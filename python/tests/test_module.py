@@ -1,6 +1,6 @@
 """The `newdb` module against the in-memory store (`Db.memory()`, the oracle).
 
-The same calls work on `Db.open(path)`; test_engine.py runs them there once the engine lands.
+test_engine.py runs the same model check on `Db.open(path)`.
 """
 
 import random
@@ -237,11 +237,15 @@ def tokens(b):
 
 @pytest.mark.parametrize("seed", [1, 2, 3])
 def test_answers_match_a_python_model_of_the_semantics(seed):
-    rng = random.Random(seed)
-    posts = random_posts(rng)
     db = newdb.Db.memory()
+    posts = random_posts(random.Random(seed))
     for i in range(0, len(posts), 7):
         db.ingest(posts[i : i + 7])
+    check_against_model(db, posts)
+
+
+def check_against_model(db, posts):
+    """Checks every kind of answer `db` gives for `posts` against the Python model."""
     spans = merged(posts)
 
     roots = sorted((s for s in spans if "parent_span_id" not in s), key=run_key, reverse=True)
