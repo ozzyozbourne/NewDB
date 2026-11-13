@@ -367,6 +367,8 @@ fn runs_by_time_matches_oracle() {
         error_runs += errors.len();
         for b in &builders {
             assert_eq!(b.runs().0, runs, "batch split changes runs");
+            let newest: Vec<Run> = b.runs_newest().map(|s| run_of(s, &p.strings)).collect();
+            assert_eq!(newest, expected, "runs_newest");
             assert_eq!(b.error_positions().0, errors);
         }
         with_files(&sealed, |files| {
@@ -560,4 +562,134 @@ fn readers_reject_truncated_and_foreign_files() {
             assert!(!ok, "{} opened a file cut to {cut} bytes", def.name);
         }
     }
+}
+
+/// Postings lookups over 100k spans, from the builder and from the sealed file. Forge's
+/// search took 765 ms on compacted segments against 19 ms uncompacted; here a lookup's
+/// cost depends only on the token's postings, so a rare token stays cheap however large
+/// the partition, and the bounds are loose enough for debug builds.
+#[test]
+fn fts_postings_lookup_timing_100k_spans() {
+    use std::time::{Duration, Instant};
+    const SPANS: usize = 100_000;
+    let mut rng = Rng::new(5);
+    let words = ["refund", "policy", "order", "invoice", "shipping", "delay"];
+    let posts: Vec<Span> = (0..SPANS)
+        .map(|i| {
+            let mut text = format!("{{\"content\":\"common {}", rng.pick(&words));
+            if i % 100 == 0 {
+                text.push_str(" rare");
+            }
+            text.push_str("\"}");
+            Span {
+                project: "p".into(),
+                trace_id: TraceId([(i / 50) as u8; 16]),
+                span_id: SpanId((rng.next_u64() | 1).to_le_bytes()),
+                inputs: Some(text.into_bytes()),
+                ..Span::default()
+            }
+        })
+        .collect();
+    let headers = vec![SpanHeader::default(); SPANS];
+    let mut b = fts::Builder::default();
+    for (h, s) in headers.chunks(1000).zip(posts.chunks(1000)) {
+        b.apply(&Batch {
+            first_post: 0,
+            headers: h,
+            spans: s,
+        });
+    }
+    let mut files = LayoutFiles::default();
+    b.seal(&mut files).unwrap();
+    let (name, bytes) = &files.files[0];
+    let mut words64 = vec![0u64; bytes.len().div_ceil(8)];
+    bytemuck::cast_slice_mut::<u64, u8>(&mut words64)[..bytes.len()].copy_from_slice(bytes);
+    let set = [(
+        name.as_str(),
+        &bytemuck::cast_slice::<u64, u8>(&words64)[..bytes.len()],
+    )];
+    let r = fts::Reader::open(FileSet { files: &set }).unwrap();
+
+    let time = |f: &dyn Fn() -> usize| {
+        let (mut best, mut n) = (Duration::MAX, 0);
+        for _ in 0..5 {
+            let t = Instant::now();
+            n = f();
+            best = best.min(t.elapsed());
+        }
+        (best, n)
+    };
+    let mut report = format!("fts over {SPANS} spans, file {} KiB\n", bytes.len() / 1024);
+    for (token, want) in [
+        (&b"common"[..], SPANS),
+        (b"rare", SPANS / 100),
+        (b"missing", 0),
+    ] {
+        let (tb, nb) = time(&|| b.postings(token).0.len());
+        let (tr, nr) = time(&|| r.postings(token).0.len());
+        assert_eq!((nb, nr), (want, want));
+        report += &format!(
+            "  {:8} {:6} hits: builder {:>9.3?}, reader {:>9.3?}\n",
+            String::from_utf8_lossy(token),
+            want,
+            tb,
+            tr
+        );
+        assert!(tr < Duration::from_millis(100), "{report}");
+    }
+    let rare = r.postings(b"rare").1;
+    assert!(rare.bytes_read < 30_000, "rare token read {rare:?}");
+    println!("{report}");
+}
+
+/// Newest 50 runs on an active builder holding 200k run candidates that arrived with
+/// out-of-order start times (DESIGN.md target: 1 ms p50 for newest 50 with filters).
+#[test]
+fn runs_newest_50_timing_200k_runs() {
+    use std::time::{Duration, Instant};
+    const RUNS: usize = 200_000;
+    let mut rng = Rng::new(11);
+    let headers: Vec<SpanHeader> = (0..RUNS)
+        .map(|i| SpanHeader {
+            trace_id: TraceId((rng.next_u64() as u128 | 1).to_le_bytes()),
+            span_id: SpanId([1; 8]),
+            project: 1,
+            start_ns: 1_000_000 + rng.below(3_600_000_000_000),
+            status: if i % 20 == 0 { 2 } else { 1 },
+            fields: field::START | field::STATUS,
+            version: i as u64 + 1,
+            ..SpanHeader::default()
+        })
+        .collect();
+    let mut b = runs_by_time::Builder::default();
+    let t = Instant::now();
+    for chunk in headers.chunks(1000) {
+        // runs_by_time reads only headers.
+        b.apply(&Batch {
+            first_post: 0,
+            headers: chunk,
+            spans: &[],
+        });
+    }
+    let apply = t.elapsed();
+    let mut times: Vec<Duration> = (0..21)
+        .map(|_| {
+            let t = Instant::now();
+            let n = b
+                .runs_newest()
+                .filter(|r| r.status == Status::Error as u8)
+                .take(50)
+                .count();
+            assert_eq!(n, 50);
+            t.elapsed()
+        })
+        .collect();
+    times.sort();
+    let p50 = times[times.len() / 2];
+    let mut expected: Vec<u64> = headers.iter().map(|h| h.start_ns).collect();
+    expected.sort_unstable_by(|a, b| b.cmp(a));
+    let got: Vec<u64> = b.runs_newest().take(50).map(|r| r.start_ns).collect();
+    assert_eq!(got, expected[..50]);
+    println!("runs_by_time: {RUNS} runs applied in {apply:?}; newest 50 errors p50 {p50:?}");
+    assert!(p50 < Duration::from_millis(5), "newest 50 took {p50:?}");
 }
