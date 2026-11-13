@@ -20,13 +20,12 @@
 //! the frame size gets a frame of its own, so a small read never decompresses a large
 //! neighbour.
 
-use newdb_types::Result;
+use std::io::Write;
+
+use newdb_types::{PayloadRef, Result};
 
 use crate::payload::{ZSTD_LEVEL, codec, decompress};
 use crate::{FILE_HEADER_LEN, MAGIC_SEALED, check_file_header, corrupt, file_header};
-
-/// Raw bytes a frame collects before it is closed.
-pub const FRAME_TARGET: usize = 64 << 10;
 
 const FRAME_LEN: usize = 24;
 const ENTRY_LEN: usize = 24;
@@ -50,121 +49,236 @@ pub struct Loc {
     pub crc: u32,
 }
 
-/// Builds a file from payloads added in the order they should be laid out.
-pub struct Builder {
+/// Which payloads go in which frame, decided from their lengths alone so that frames can
+/// then be filled and compressed in any order, on any number of threads, with identical
+/// output.
+pub struct Plan {
     target: usize,
-    zstd: zstd::bulk::Compressor<'static>,
-    frames: Vec<Frame>,
-    entries: Vec<(u64, Loc)>,
-    data: Vec<u8>,
-    cur: Vec<u8>,
+    /// Payloads in layout order.
+    items: Vec<PayloadRef>,
+    /// `items` index where each closed frame ends.
+    ends: Vec<usize>,
+    cur: usize,
 }
 
-impl Builder {
-    pub fn new(target: usize) -> Result<Builder> {
-        Ok(Builder {
+impl Plan {
+    pub fn new(target: usize) -> Plan {
+        Plan {
             target: target.max(1),
-            zstd: zstd::bulk::Compressor::new(ZSTD_LEVEL)?,
-            frames: Vec::new(),
-            entries: Vec::new(),
-            data: Vec::new(),
-            cur: Vec::new(),
-        })
+            items: Vec::new(),
+            ends: Vec::new(),
+            cur: 0,
+        }
     }
 
-    /// Starts a group of payloads (one trace) totalling `raw_len` bytes: a group that fits
-    /// in a frame is not split across two, so reading a small trace decompresses one frame.
-    pub fn start_group(&mut self, raw_len: usize) -> Result<()> {
-        if !self.cur.is_empty() && self.cur.len() + raw_len > self.target {
-            self.flush()?;
-        }
-        Ok(())
+    fn open(&self) -> bool {
+        self.ends.last().copied().unwrap_or(0) < self.items.len()
     }
 
-    /// Adds the payload stored at `blob_offset` in `payloads.blob`. Each offset once.
-    pub fn add(&mut self, blob_offset: u64, raw: &[u8]) -> Result<()> {
-        let big = raw.len() >= self.target / 2;
-        if !self.cur.is_empty() && (big || self.cur.len() + raw.len() > self.target) {
-            self.flush()?;
+    fn close(&mut self) {
+        if self.open() {
+            self.ends.push(self.items.len());
+            self.cur = 0;
         }
-        let too_big = || corrupt("sealed payloads: frame larger than 4 GiB");
-        self.entries.push((
-            blob_offset,
-            Loc {
-                frame: self.frames.len() as u32,
-                at: u32::try_from(self.cur.len()).map_err(|_| too_big())?,
-                len: u32::try_from(raw.len()).map_err(|_| too_big())?,
-                crc: crc32c::crc32c(raw),
-            },
-        ));
-        self.cur.extend_from_slice(raw);
+    }
+
+    /// Starts a group of payloads (one trace) totalling `raw_len` bytes. A group that fits
+    /// in a frame is not split across two, and a group starts a new frame once the current
+    /// one holds an eighth of the target, so a small trace decompresses about its own
+    /// bytes while a large one fills whole frames.
+    pub fn start_group(&mut self, raw_len: usize) {
+        if self.cur >= self.target / 8 || self.cur + raw_len > self.target {
+            self.close();
+        }
+    }
+
+    /// Adds a payload of `payloads.blob`. Each offset at most once.
+    pub fn add(&mut self, r: PayloadRef) {
+        let len = r.raw_len as usize;
+        let big = len >= self.target / 2;
+        if big || self.cur + len > self.target {
+            self.close();
+        }
+        self.items.push(r);
+        self.cur += len;
         if big {
-            self.flush()?;
+            self.close();
         }
-        Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
-        let c = self.zstd.compress(&self.cur)?;
-        let (codec, data) = if c.len() < self.cur.len() {
-            (codec::ZSTD as u32, &c[..])
-        } else {
-            (codec::RAW as u32, &self.cur[..])
-        };
-        self.frames.push(Frame {
-            offset: self.data.len() as u64,
-            len: data.len() as u32,
-            raw_len: self.cur.len() as u32,
-            crc: crc32c::crc32c(data),
-            codec,
-        });
-        self.data.extend_from_slice(data);
-        self.cur.clear();
-        Ok(())
+    /// Adds a payload in a frame of its own.
+    pub fn add_alone(&mut self, r: PayloadRef) {
+        self.close();
+        self.items.push(r);
+        self.close();
     }
 
-    pub fn finish(mut self) -> Result<Vec<u8>> {
-        // Also flush a frame holding only empty payloads, so their entries point at one.
-        let pending = self
-            .entries
-            .last()
-            .is_some_and(|e| e.1.frame as usize == self.frames.len());
-        if pending {
-            self.flush()?;
+    pub fn finish(mut self) -> Plan {
+        self.close();
+        self
+    }
+
+    pub fn frame_count(&self) -> usize {
+        self.ends.len()
+    }
+
+    /// The payloads of frame `i`, in order.
+    pub fn frame(&self, i: usize) -> &[PayloadRef] {
+        let start = if i == 0 { 0 } else { self.ends[i - 1] };
+        &self.items[start..self.ends[i]]
+    }
+}
+
+/// One frame, compressed, with the CRC of each payload in it.
+pub struct FrameData {
+    codec: u32,
+    raw_len: u32,
+    data: Vec<u8>,
+    crcs: Vec<u32>,
+}
+
+/// Fills and compresses every frame of `plan`, reading each payload's raw bytes with
+/// `read`. Frames are split into contiguous runs of similar raw size, one per thread.
+pub fn build(
+    plan: &Plan,
+    threads: usize,
+    read: &(dyn Fn(PayloadRef) -> Result<Vec<u8>> + Sync),
+) -> Result<Vec<FrameData>> {
+    let n = plan.frame_count();
+    let raw = |i: usize| plan.frame(i).iter().map(|r| r.raw_len as u64).sum::<u64>();
+    let total: u64 = (0..n).map(raw).sum();
+    let threads = threads.clamp(1, n.max(1));
+    let mut bounds = vec![0];
+    let mut acc = 0;
+    for i in 0..n {
+        acc += raw(i);
+        if bounds.len() < threads && acc * threads as u64 >= total * bounds.len() as u64 {
+            bounds.push(i + 1);
         }
-        self.entries.sort_unstable_by_key(|e| e.0);
-        if self.entries.windows(2).any(|w| w[0].0 == w[1].0) {
+    }
+    bounds.push(n);
+    bounds.dedup();
+    let run = |from: usize, to: usize| -> Result<Vec<FrameData>> {
+        let mut zstd = zstd::bulk::Compressor::new(ZSTD_LEVEL)?;
+        let mut buf = Vec::new();
+        (from..to)
+            .map(|i| {
+                buf.clear();
+                let mut crcs = Vec::with_capacity(plan.frame(i).len());
+                for r in plan.frame(i) {
+                    let p = read(*r)?;
+                    if p.len() != r.raw_len as usize {
+                        return Err(corrupt("sealed payloads: payload length differs"));
+                    }
+                    crcs.push(crc32c::crc32c(&p));
+                    buf.extend_from_slice(&p);
+                }
+                let raw_len = u32::try_from(buf.len())
+                    .map_err(|_| corrupt("sealed payloads: frame larger than 4 GiB"))?;
+                let c = zstd.compress(&buf)?;
+                let (codec, data) = if c.len() < buf.len() {
+                    (codec::ZSTD as u32, c)
+                } else {
+                    (codec::RAW as u32, buf.clone())
+                };
+                Ok(FrameData {
+                    codec,
+                    raw_len,
+                    data,
+                    crcs,
+                })
+            })
+            .collect()
+    };
+    let parts: Vec<Result<Vec<FrameData>>> = std::thread::scope(|sc| {
+        let spawned: Vec<_> = bounds
+            .windows(2)
+            .skip(1)
+            .map(|w| sc.spawn(move || run(w[0], w[1])))
+            .collect();
+        let mut out = vec![run(bounds[0], bounds.get(1).copied().unwrap_or(0))];
+        for h in spawned {
+            out.push(h.join().unwrap_or_else(|_| {
+                Err(newdb_types::Error::Io(std::io::Error::other(
+                    "seal thread panicked",
+                )))
+            }));
+        }
+        out
+    });
+    let mut frames = Vec::with_capacity(n);
+    for p in parts {
+        frames.extend(p?);
+    }
+    Ok(frames)
+}
+
+/// Writes the file for `plan` and its built `frames` to `w`.
+pub fn write(plan: &Plan, frames: &[FrameData], w: &mut dyn Write) -> Result<()> {
+    if frames.len() != plan.frame_count() {
+        return Err(newdb_types::Error::InvalidInput(
+            "sealed payloads: frames do not match the plan".into(),
+        ));
+    }
+    let mut entries: Vec<(u64, Loc)> = Vec::with_capacity(plan.items.len());
+    for (i, f) in frames.iter().enumerate() {
+        let mut at = 0u32;
+        if f.crcs.len() != plan.frame(i).len() {
             return Err(newdb_types::Error::InvalidInput(
-                "sealed payloads: an offset was added twice".into(),
+                "sealed payloads: frames do not match the plan".into(),
             ));
         }
-        let mut tables =
-            Vec::with_capacity(self.frames.len() * FRAME_LEN + self.entries.len() * ENTRY_LEN);
-        for f in &self.frames {
-            tables.extend_from_slice(&f.offset.to_le_bytes());
-            for v in [f.len, f.raw_len, f.crc, f.codec] {
-                tables.extend_from_slice(&v.to_le_bytes());
-            }
+        for (r, &crc) in plan.frame(i).iter().zip(&f.crcs) {
+            entries.push((
+                r.offset,
+                Loc {
+                    frame: i as u32,
+                    at,
+                    len: r.raw_len,
+                    crc,
+                },
+            ));
+            at += r.raw_len;
         }
-        for (off, l) in &self.entries {
-            tables.extend_from_slice(&off.to_le_bytes());
-            for v in [l.frame, l.at, l.len, l.crc] {
-                tables.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        let mut out = file_header(MAGIC_SEALED, 0).to_vec();
-        for v in [
-            self.frames.len() as u32,
-            self.entries.len() as u32,
-            crc32c::crc32c(&tables),
-            0,
-        ] {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        out.extend_from_slice(&tables);
-        out.extend_from_slice(&self.data);
-        Ok(out)
     }
+    entries.sort_unstable_by_key(|e| e.0);
+    if entries.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err(newdb_types::Error::InvalidInput(
+            "sealed payloads: an offset was added twice".into(),
+        ));
+    }
+    let mut tables = Vec::with_capacity(frames.len() * FRAME_LEN + entries.len() * ENTRY_LEN);
+    let mut offset = 0u64;
+    for f in frames {
+        tables.extend_from_slice(&offset.to_le_bytes());
+        let len = u32::try_from(f.data.len())
+            .map_err(|_| corrupt("sealed payloads: frame larger than 4 GiB"))?;
+        for v in [len, f.raw_len, crc32c::crc32c(&f.data), f.codec] {
+            tables.extend_from_slice(&v.to_le_bytes());
+        }
+        offset += f.data.len() as u64;
+    }
+    for (off, l) in &entries {
+        tables.extend_from_slice(&off.to_le_bytes());
+        for v in [l.frame, l.at, l.len, l.crc] {
+            tables.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    let mut head = file_header(MAGIC_SEALED, 0).to_vec();
+    for v in [
+        frames.len() as u32,
+        entries.len() as u32,
+        crc32c::crc32c(&tables),
+        0,
+    ] {
+        head.extend_from_slice(&v.to_le_bytes());
+    }
+    w.write_all(&head)?;
+    w.write_all(&tables)?;
+    for f in frames {
+        w.write_all(&f.data)?;
+    }
+    Ok(())
 }
 
 fn le32(b: &[u8], at: usize) -> u32 {
@@ -335,7 +449,7 @@ impl<'a> Sealed<'a> {
         Ok(out)
     }
 
-    /// Checks frame `i`'s CRC, decompression and the CRC of every payload in it.
+    /// Checks frame `i`'s CRC and that `raw`, its decompressed bytes, has its length.
     pub fn check_frame(&self, i: usize, raw: &[u8]) -> Result<()> {
         let f = self.frame(i);
         if crc32c::crc32c(self.frame_data(&f)) != f.crc {
@@ -348,7 +462,7 @@ impl<'a> Sealed<'a> {
     }
 
     /// The payload at `loc` within its frame's raw bytes, CRC-checked.
-    pub fn slice<'r>(raw: &'r [u8], loc: Loc) -> Result<&'r [u8]> {
+    pub fn slice(raw: &[u8], loc: Loc) -> Result<&[u8]> {
         let p = raw
             .get(loc.at as usize..loc.at as usize + loc.len as usize)
             .ok_or_else(|| corrupt("payloads.sealed: payload outside its frame"))?;
@@ -374,8 +488,17 @@ impl<'a> Sealed<'a> {
 mod tests {
     use super::*;
 
-    fn sample() -> (Vec<u8>, Vec<(u64, Vec<u8>)>) {
-        let mut b = Builder::new(1024).unwrap();
+    fn r(offset: u64, raw_len: usize) -> PayloadRef {
+        PayloadRef {
+            offset,
+            len: 1,
+            raw_len: raw_len as u32,
+        }
+    }
+
+    /// Payloads keyed by their (fake) blob offset, with groups, a large payload and an
+    /// empty one; built with `threads` threads.
+    fn sample(threads: usize) -> (Vec<u8>, Vec<(u64, Vec<u8>)>) {
         let mut payloads = Vec::new();
         for i in 0..40u64 {
             let p = format!("{{\"content\":\"refund policy {i}\"}}").repeat(1 + i as usize % 7);
@@ -383,41 +506,64 @@ mod tests {
         }
         payloads.push((5, b"x".repeat(5000))); // its own frame
         payloads.push((7, Vec::new()));
-        for (o, p) in &payloads {
-            b.add(*o, p).unwrap();
+        let mut plan = Plan::new(1024);
+        for (k, (o, p)) in payloads.iter().enumerate() {
+            if k % 5 == 0 {
+                let group: usize = payloads[k..(k + 5).min(payloads.len())]
+                    .iter()
+                    .map(|p| p.1.len())
+                    .sum();
+                plan.start_group(group);
+            }
+            plan.add(r(*o, p.len()));
         }
-        (b.finish().unwrap(), payloads)
+        let plan = plan.finish();
+        let by_offset: std::collections::HashMap<u64, Vec<u8>> = payloads.iter().cloned().collect();
+        let frames = build(&plan, threads, &|r| Ok(by_offset[&r.offset].clone())).unwrap();
+        let mut file = Vec::new();
+        write(&plan, &frames, &mut file).unwrap();
+        (file, payloads)
     }
 
     #[test]
-    fn round_trips_every_payload_and_frames_large_ones_alone() {
-        let (file, payloads) = sample();
+    fn round_trips_every_payload_the_same_on_any_thread_count() {
+        let (file, payloads) = sample(1);
+        for threads in [2, 3, 64] {
+            assert!(sample(threads).0 == file, "{threads} threads");
+        }
         let s = Sealed::open(&file).unwrap();
         assert_eq!(s.entry_count(), payloads.len());
         assert!(s.frame_count() > 3);
         for (o, p) in &payloads {
             assert_eq!(&s.read(*o).unwrap(), p, "offset {o}");
         }
+        // A large payload has a frame to itself.
         let big = s.find(5).unwrap();
         assert_eq!(s.frame(big.frame as usize).raw_len, 5000);
         assert!(s.find(6).is_none() && s.read(6).is_err());
         for i in 0..s.frame_count() {
             s.check_frame(i, &s.decompress(i).unwrap()).unwrap();
         }
+        // A group that fits in a frame is not split: payloads 1000..=960 share a frame.
+        let f = s.find(1000).unwrap().frame;
         assert!(
-            Builder::new(64)
-                .and_then(|mut b| {
-                    b.add(1, b"a")?;
-                    b.add(1, b"b")?;
-                    b.finish()
-                })
-                .is_err()
+            [990, 980, 970, 960]
+                .iter()
+                .all(|&o| s.find(o).unwrap().frame == f)
         );
+
+        let mut plan = Plan::new(64);
+        plan.add(r(1, 1));
+        plan.add(r(1, 1));
+        let plan = plan.finish();
+        let frames = build(&plan, 1, &|_| Ok(vec![0])).unwrap();
+        assert!(write(&plan, &frames, &mut Vec::new()).is_err());
+        assert!(build(&plan, 1, &|_| Ok(vec![0, 0])).is_err());
     }
 
     #[test]
     fn damage_is_an_error_not_a_panic() {
-        let (file, payloads) = sample();
+        let (file, payloads) = sample(1);
         let tables_end = Sealed::open(&file).unwrap().layout.data_start;
         for cut in 0..file.len() {
             assert!(Sealed::open(&file[..cut]).is_err(), "cut {cut}");
@@ -427,7 +573,7 @@ mod tests {
             bad[i] ^= 0x10;
             match Sealed::open(&bad) {
                 // Damage in the header or tables is caught on open.
-                Err(_) => assert!(i < tables_end || i >= file.len(), "{i}"),
+                Err(_) => assert!(i < tables_end, "{i}"),
                 // Damage in frame data is caught when the frame is read or checked.
                 Ok(s) => {
                     assert!(i >= tables_end, "flip {i} in the tables went unnoticed");

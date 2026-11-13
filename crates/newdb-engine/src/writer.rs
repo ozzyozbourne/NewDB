@@ -37,7 +37,7 @@ use crate::files::{
 };
 use crate::part::{
     Blob, Body, Group, Layouts, Live, Mode, PARALLEL_APPLY, PAYLOAD_FIELDS, Part, Stats, Strings,
-    cores, corrupt, open_sealed, present, replay,
+    cores, corrupt, open_sealed, present, replay, write_sealed_payloads,
 };
 
 pub(crate) type Ack = Sender<Result<()>>;
@@ -447,6 +447,7 @@ impl Writer {
             let mut shared = a.overlap.clone();
             shared.sort_unstable();
             write_synced(&dir.join(OVERLAP), &overlap::encode(&shared))?;
+            write_sealed_payloads(&dir, a.pay_len)?;
             sync_dir(&dir)?;
             entry(&a.part, &g.stats)
         };
@@ -460,6 +461,10 @@ impl Writer {
         if let Some(a) = a {
             self.inner.replace(sealed_part(&a.part, fixed));
         }
+        // Sealed queries, verify and rebuild read payloads.sealed now. Readers that still
+        // hold the active partition keep its open file. A blob left by a crash here is
+        // removed when the database next opens.
+        let _ = fs::remove_file(dir.join(PAYLOADS)).and_then(|_| File::open(&dir)?.sync_all());
         Ok(())
     }
 

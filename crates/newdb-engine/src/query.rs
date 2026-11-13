@@ -17,8 +17,8 @@ use newdb_types::{
 };
 
 use crate::part::{
-    ALL_PAYLOADS, BlobRef, PAYLOAD_FIELDS, View, cores, corrupt, payload_ref, set_payload,
-    summary_key, to_span,
+    ALL_PAYLOADS, BlobRef, PAYLOAD_FIELDS, Payloads, View, cores, corrupt, payload_ref,
+    set_payload, summary_key, to_span,
 };
 
 /// One span merged across partitions, without payloads until [`load_payloads`].
@@ -104,48 +104,11 @@ pub(crate) fn load_trace(
     Ok(out)
 }
 
-/// Payload reads of one query, one at a time. A sealed partition decompresses a whole
-/// frame to read one payload, so the query keeps the frames it decompressed (up to
-/// [`FRAME_CACHE`] bytes) for the payloads that share them: the fields of one span, and
-/// the spans of one trace.
-pub(crate) struct Payloads<'a> {
-    blobs: Vec<BlobRef<'a>>,
-    frames: HashMap<(usize, u32), Vec<u8>>,
-    cached: usize,
-}
-
+/// Decompressed sealed frames one query keeps for its single payload reads.
 const FRAME_CACHE: usize = 16 << 20;
 
-impl<'a> Payloads<'a> {
-    pub fn new(views: &'a [View<'_>]) -> Payloads<'a> {
-        Payloads {
-            blobs: views.iter().map(|v| v.blob()).collect(),
-            frames: HashMap::new(),
-            cached: 0,
-        }
-    }
-
-    /// The payload `r` of partition `pi`.
-    pub fn read(&mut self, pi: usize, r: PayloadRef, st: &mut ReadStats) -> Result<Vec<u8>> {
-        let bytes = match self.blobs[pi].locate(r)? {
-            None => self.blobs[pi].read(r)?,
-            Some((s, loc)) => {
-                let key = (pi, loc.frame);
-                if !self.frames.contains_key(&key) {
-                    let raw = s.decompress(loc.frame as usize)?;
-                    if self.cached + raw.len() > FRAME_CACHE {
-                        self.frames.clear();
-                        self.cached = 0;
-                    }
-                    self.cached += raw.len();
-                    self.frames.insert(key, raw);
-                }
-                Sealed::slice(&self.frames[&key], loc)?.to_vec()
-            }
-        };
-        st.payload_bytes_decompressed += bytes.len() as u64;
-        Ok(bytes)
-    }
+fn payloads<'a>(views: &'a [View<'_>]) -> Payloads<'a> {
+    Payloads::new(views.iter().map(|v| v.blob()).collect(), FRAME_CACHE)
 }
 
 /// Fills the payload fields in `mask`: each comes from the last piece that set it.
@@ -161,7 +124,8 @@ fn load_payloads(
         }
         let found = m.pieces().rev().find(|(_, h)| h.has(bit)).copied();
         if let Some((pi, h)) = found {
-            let bytes = pay.read(pi, payload_ref(&h, bit), st)?;
+            let bytes = pay.read(pi, payload_ref(&h, bit))?;
+            st.payload_bytes_decompressed += bytes.len() as u64;
             set_payload(&mut m.span, bit, bytes)?;
         }
     }
@@ -483,7 +447,7 @@ pub(crate) fn search(
         return Ok(done(Vec::new(), st, ph));
     }
     let toks: Vec<&[u8]> = want.iter().map(Vec::as_slice).collect();
-    let mut pay = Payloads::new(views);
+    let mut pay = payloads(views);
 
     // Spans of spread traces, merged, newest first (popped from the back).
     let mut spread: Vec<(RunKey, Merged)> = Vec::new();
@@ -581,7 +545,9 @@ pub(crate) fn search(
                     if !h.has(bit) {
                         return Ok(None);
                     }
-                    pay.read(pi, payload_ref(h, bit), &mut st).map(Some)
+                    let bytes = pay.read(pi, payload_ref(h, bit))?;
+                    st.payload_bytes_decompressed += bytes.len() as u64;
+                    Ok(Some(bytes))
                 };
                 let (i, o) = (read(INPUTS)?, read(OUTPUTS)?);
                 if matches(&want, i.as_deref(), o.as_deref()) {

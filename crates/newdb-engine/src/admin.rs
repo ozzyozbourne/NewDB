@@ -9,8 +9,8 @@ use newdb_format::{log, overlap, payload, strings as strtbl};
 use newdb_layouts::{LAYOUTS, LayoutFiles};
 use newdb_types::{Result, SpanId, TraceId};
 
-use crate::files::{self, LAYOUTS_DIR, LOG, OVERLAP, PAYLOADS, STRINGS, TRASH, layout_dir_name};
-use crate::part::{Mode, log_traces, present, replay};
+use crate::files::{self, LAYOUTS_DIR, LOG, OVERLAP, STRINGS, TRASH, layout_dir_name};
+use crate::part::{Mode, log_traces, payload_sizes, present, replay};
 use crate::{Inner, InspectReport, PartitionInfo, VerifyReport};
 
 pub(crate) fn verify(inner: &Inner) -> Result<VerifyReport> {
@@ -219,8 +219,7 @@ pub(crate) fn inspect(inner: &Inner, partitions: Vec<PartitionInfo>) -> Result<I
                 _ => {}
             }
         }
-        let pay = files::map(&p.dir.join(PAYLOADS))?;
-        sizes.extend(payload::Scan::new(&pay)?.map(|e| e.r.raw_len as u64));
+        sizes.extend(payload_sizes(&p.dir, p.sealed)?);
     }
     let mut per_trace: HashMap<(&str, TraceId), u64> = HashMap::new();
     for (project, t, _) in span_parts.keys() {

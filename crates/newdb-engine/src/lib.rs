@@ -259,6 +259,15 @@ impl Db {
                 manifest::write(&path, &manifest)?;
             }
             remove_dir_if_exists(&trash)?;
+            // A seal that crashed after MANIFEST listed the partition but before it
+            // deleted payloads.blob, which payloads.sealed replaces.
+            for e in &manifest.partitions {
+                let dir = path.join(&e.name);
+                if dir.join(files::SEALED_PAYLOADS).exists() && dir.join(files::PAYLOADS).exists() {
+                    fs::remove_file(dir.join(files::PAYLOADS))?;
+                    files::sync_dir(&dir)?;
+                }
+            }
         }
 
         let mut parts = Vec::new();
@@ -459,7 +468,13 @@ fn info(p: &Part) -> PartitionInfo {
         posts: st.posts,
         spans: st.spans,
         log_bytes: file_len(&p.dir.join(files::LOG)),
-        payload_bytes: file_len(&p.dir.join(files::PAYLOADS)),
+        payload_bytes: match p.sealed {
+            true => {
+                file_len(&p.dir.join(files::PAYLOADS))
+                    + file_len(&p.dir.join(files::SEALED_PAYLOADS))
+            }
+            false => file_len(&p.dir.join(files::PAYLOADS)),
+        },
         min_start_ns: st.min_start(),
         max_start_ns: st.max_start(),
         layouts,

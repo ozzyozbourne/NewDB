@@ -736,3 +736,101 @@ fn parallel_apply_matches_one_thread() {
         );
     }
 }
+
+#[test]
+fn sealed_payloads_replace_the_blob_through_crashes() {
+    use crate::files::{PAYLOADS, SEALED_PAYLOADS};
+    let src = TestDir::new("psl-src");
+    let posts = generate(&GenConfig::small(23));
+    let half = posts.len() / 2;
+    let oracle = Oracle::new();
+    let active = {
+        let d = Driver::new(src.path(), 2, 3, 0);
+        compare(&oracle, &d, &posts[..half], 10).unwrap();
+        d.with(|db| db.seal_active()).unwrap();
+        // The rest stays in the active partition.
+        d.clock.advance(HOUR);
+        for c in posts[half..].chunks(10) {
+            oracle.ingest(c.to_vec()).unwrap();
+            d.with(|db| db.ingest(c.to_vec())).unwrap();
+        }
+        let info = d.with(|db| db.partitions().unwrap());
+        let db = d.db.write().unwrap().take().unwrap();
+        db.close().unwrap();
+        assert!(info.iter().filter(|p| p.sealed).count() >= 2);
+        for p in info.iter().filter(|p| p.sealed) {
+            let dir = src.path().join(&p.name);
+            assert!(dir.join(SEALED_PAYLOADS).exists() && !dir.join(PAYLOADS).exists());
+            assert_eq!(
+                p.payload_bytes,
+                std::fs::metadata(dir.join(SEALED_PAYLOADS)).unwrap().len()
+            );
+        }
+        info.iter().find(|p| !p.sealed).unwrap().name.clone()
+    };
+    let sealed_ok = |root: &Path, name: &str| {
+        let dir = root.join(name);
+        dir.join(SEALED_PAYLOADS).exists() && !dir.join(PAYLOADS).exists()
+    };
+
+    // A seal that crashed after MANIFEST, before deleting the blob: read-only opens use
+    // payloads.sealed, and the next writable open deletes the blob.
+    let a = TestDir::new("psl-left");
+    copy_dir(src.path(), a.path());
+    let blob = std::fs::read(a.path().join(&active).join(PAYLOADS)).unwrap();
+    let d = Driver::new(a.path(), 0, 0, 0);
+    d.with(|db| db.seal_active()).unwrap();
+    let reference = std::fs::read(a.path().join(&active).join(SEALED_PAYLOADS)).unwrap();
+    std::fs::write(a.path().join(&active).join(PAYLOADS), &blob).unwrap();
+    d.reopen(true);
+    queries_agree(&oracle, &d, &posts);
+    assert!(!sealed_ok(a.path(), &active));
+    d.reopen(false);
+    assert!(sealed_ok(a.path(), &active));
+    queries_agree(&oracle, &d, &posts);
+    let report = d.with(|db| db.verify().unwrap());
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    d.with(|db| db.rebuild(None).unwrap());
+    queries_agree(&oracle, &d, &posts);
+
+    // A seal that crashed while writing payloads.sealed, before MANIFEST listed the
+    // partition: it recovers from its log and blob, ignoring the stale file, and seals
+    // again to the same bytes.
+    let b = TestDir::new("psl-torn");
+    copy_dir(src.path(), b.path());
+    let mut torn = b"NEWDBPSL".to_vec();
+    torn.extend_from_slice(&[0x5a; 40]);
+    std::fs::write(b.path().join(&active).join(SEALED_PAYLOADS), torn).unwrap();
+    let db_b = Driver::new(b.path(), 0, 0, 0);
+    queries_agree(&oracle, &db_b, &posts);
+    let blob_len = std::fs::metadata(b.path().join(&active).join(PAYLOADS))
+        .unwrap()
+        .len();
+    let info = db_b.with(|db| db.partitions().unwrap());
+    let p = info.iter().find(|p| p.name == active).unwrap();
+    assert!(!p.sealed && p.payload_bytes == blob_len);
+    assert!(db_b.with(|db| db.inspect()).is_ok());
+    db_b.with(|db| db.seal_active()).unwrap();
+    assert!(sealed_ok(b.path(), &active));
+    let resealed = std::fs::read(b.path().join(&active).join(SEALED_PAYLOADS)).unwrap();
+    assert!(resealed == reference, "reseal wrote different bytes");
+    assert!(db_b.with(|db| db.verify().unwrap()).problems.is_empty());
+    db_b.reopen(true);
+    queries_agree(&oracle, &db_b, &posts);
+
+    // Damaged frame data is a verify problem.
+    let file = a.path().join(&active).join(SEALED_PAYLOADS);
+    let mut bytes = std::fs::read(&file).unwrap();
+    let at = bytes.len() - 2;
+    bytes[at] ^= 0x40;
+    std::fs::write(&file, bytes).unwrap();
+    let report = d.with(|db| db.verify().unwrap());
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("payloads.sealed")),
+        "{:?}",
+        report.problems
+    );
+}
