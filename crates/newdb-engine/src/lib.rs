@@ -503,7 +503,8 @@ impl Store for Db {
             return Ok(());
         }
         validate(&spans)?;
-        self.call(|ack| Msg::Ingest(spans, ack))
+        let pre = writer::prepare(&spans)?;
+        self.call(|ack| Msg::Ingest(spans, pre, ack))
     }
 
     fn trace(&self, query: &TraceQuery) -> Result<Read<Vec<Span>>> {

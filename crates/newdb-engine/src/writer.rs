@@ -28,7 +28,8 @@ use crate::part::{
 pub(crate) type Ack = Sender<Result<()>>;
 
 pub(crate) enum Msg {
-    Ingest(Vec<Span>, Ack),
+    /// Posts and their payloads as [`prepare`] stored them, in the same order.
+    Ingest(Vec<Span>, Vec<Prepared>, Ack),
     Seal(Ack),
     Retention(Ack),
     Rebuild(Option<String>, Ack),
@@ -53,7 +54,6 @@ pub(crate) struct Writer {
     inner: Arc<Inner>,
     manifest: Manifest,
     active: Option<Active>,
-    enc: payload::Encoder,
     next_version: u64,
     next_id: u64,
     retention_hour: u64,
@@ -84,7 +84,6 @@ impl Writer {
             inner,
             manifest,
             active: None,
-            enc: payload::Encoder::new()?,
             next_version: max_version + 1,
             next_id: max_id + 1,
             retention_hour: 0,
@@ -118,18 +117,18 @@ impl Writer {
                 },
             };
             match msg {
-                Msg::Ingest(spans, ack) => {
+                Msg::Ingest(spans, pre, ack) => {
                     // Group commit: take what queued up while the last batch was being
                     // written and synced, without waiting for more. An idle writer
                     // commits a lone request at once; `commit_interval` is only an
                     // upper bound on the wait.
-                    let mut batch = vec![(spans, ack)];
+                    let mut batch = vec![(spans, pre, ack)];
                     let mut bytes = size(&batch[0].0);
                     while bytes < self.inner.config.commit_bytes {
                         match rx.try_recv() {
-                            Ok(Msg::Ingest(s, a)) => {
+                            Ok(Msg::Ingest(s, p, a)) => {
                                 bytes += size(&s);
-                                batch.push((s, a));
+                                batch.push((s, p, a));
                             }
                             Ok(other) => {
                                 stashed = Some(other);
@@ -171,10 +170,14 @@ impl Writer {
         Ok(())
     }
 
-    fn commit(&mut self, batch: Vec<(Vec<Span>, Ack)>) {
-        let (spans, acks): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
-        let spans: Vec<Span> = spans.into_iter().flatten().collect();
-        let res = self.roll().and_then(|_| self.write(spans));
+    fn commit(&mut self, batch: Vec<(Vec<Span>, Vec<Prepared>, Ack)>) {
+        let (mut spans, mut pre, mut acks) = (Vec::new(), Vec::new(), Vec::new());
+        for (s, p, a) in batch {
+            spans.extend(s);
+            pre.extend(p);
+            acks.push(a);
+        }
+        let res = self.roll().and_then(|_| self.write(spans, pre));
         for ack in acks {
             let _ = ack.send(res.as_ref().map(|_| ()).map_err(dup));
         }
@@ -287,7 +290,7 @@ impl Writer {
 
     /// Appends `spans` to the active partition (creating it if needed), syncs, and makes
     /// them visible to readers.
-    fn write(&mut self, spans: Vec<Span>) -> Result<()> {
+    fn write(&mut self, spans: Vec<Span>, pre: Vec<Prepared>) -> Result<()> {
         if spans.is_empty() {
             return Ok(());
         }
@@ -314,7 +317,7 @@ impl Writer {
         }
         let (headers, new_traces) = {
             let g = live.read().unwrap_or_else(|e| e.into_inner());
-            let headers = enc.encode(&spans, &g.strings, &a.dedup, &a.pay, &mut self.enc)?;
+            let headers = enc.encode(&spans, &pre, &g.strings, &a.dedup, &a.pay)?;
             let mut new: Vec<TraceId> = headers
                 .iter()
                 .map(|h| h.trace_id)
@@ -646,26 +649,26 @@ impl Encoding {
 
     /// Encodes a batch: string records and payload entries, then one post record per
     /// span. Payloads are deduplicated against the partition and within the batch first,
-    /// then the new ones are compressed and appended.
+    /// then the new ones are appended as the ingesting thread compressed them.
     fn encode(
         &mut self,
         spans: &[Span],
+        pre: &[Prepared],
         table: &Strings,
         committed: &HashMap<payload::Hash, Vec<PayloadRef>>,
         file: &File,
-        enc: &mut payload::Encoder,
     ) -> Result<Vec<SpanHeader>> {
         let mut headers: Vec<SpanHeader> = spans.iter().map(|s| self.scalars(s, table)).collect();
         // Every payload of the batch: (span, field), and where its stored copy comes from.
         let mut jobs: Vec<(usize, u32, Src)> = Vec::new();
-        let mut fresh: Vec<(&[u8], payload::Hash)> = Vec::new();
+        let mut fresh: Vec<(&[u8], &Stored)> = Vec::new();
         let mut by_hash: HashMap<payload::Hash, Vec<usize>> = HashMap::new();
-        for (i, s) in spans.iter().enumerate() {
-            for bit in PAYLOAD_FIELDS {
+        for (i, (s, p)) in spans.iter().zip(pre).enumerate() {
+            for stored in p {
+                let (bit, h) = (stored.bit, stored.hash);
                 let Some(raw) = payload_field(s, bit) else {
-                    continue;
+                    return Err(corrupt("prepared payload of an unset field"));
                 };
-                let h = payload::hash(raw);
                 if let Some(r) = self.committed(raw, h, committed, file)? {
                     jobs.push((i, bit, Src::Stored(r)));
                     continue;
@@ -675,7 +678,7 @@ impl Encoding {
                     Some(&k) => k,
                     None => {
                         same.push(fresh.len());
-                        fresh.push((raw, h));
+                        fresh.push((raw, stored));
                         fresh.len() - 1
                     }
                 };
@@ -683,9 +686,15 @@ impl Encoding {
             }
         }
         let mut refs = Vec::with_capacity(fresh.len());
-        for (raw, h) in &fresh {
-            let r = enc.append(raw, *h, self.pay_base, &mut self.pay)?;
-            self.new_dedup.entry(*h).or_default().push(r);
+        for (raw, p) in &fresh {
+            let r = payload::append_entry(
+                raw,
+                p.data.as_deref(),
+                p.hash,
+                self.pay_base,
+                &mut self.pay,
+            )?;
+            self.new_dedup.entry(p.hash).or_default().push(r);
             refs.push(r);
         }
         for (i, bit, r) in jobs {
@@ -748,6 +757,79 @@ impl Encoding {
         h.fields = f;
         h
     }
+}
+
+/// One payload of a post as the ingesting thread prepared it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Stored {
+    pub bit: u32,
+    pub hash: payload::Hash,
+    /// The zstd frame, or `None` to store the bytes raw.
+    pub data: Option<Vec<u8>>,
+}
+
+/// The payloads of one post.
+pub(crate) type Prepared = Vec<Stored>;
+
+/// Below this many payload bytes per thread, splitting a batch costs more than it saves.
+const PARALLEL_BYTES: usize = 256 << 10;
+
+/// Hashes and compresses the payloads of `spans` on the calling thread, so concurrent
+/// ingests compress in parallel and the writer only deduplicates and appends. A large
+/// batch is split across a few scoped threads.
+pub(crate) fn prepare(spans: &[Span]) -> Result<Vec<Prepared>> {
+    let total: usize = spans.iter().map(|s| size(std::slice::from_ref(s))).sum();
+    prepare_on(
+        spans,
+        crate::part::cores().min(8).min(total / PARALLEL_BYTES + 1),
+    )
+}
+
+pub(crate) fn prepare_on(spans: &[Span], threads: usize) -> Result<Vec<Prepared>> {
+    if threads <= 1 {
+        return spans.iter().map(prepare_one).collect();
+    }
+    let chunk = spans.len().div_ceil(threads);
+    std::thread::scope(|sc| {
+        let parts: Vec<_> = spans
+            .chunks(chunk)
+            .map(|c| sc.spawn(move || c.iter().map(prepare_one).collect::<Result<Vec<_>>>()))
+            .collect();
+        let mut out = Vec::with_capacity(spans.len());
+        for p in parts {
+            let part = p
+                .join()
+                .map_err(|_| Error::Io(std::io::Error::other("compression thread panicked")))?;
+            out.extend(part?);
+        }
+        Ok(out)
+    })
+}
+
+thread_local! {
+    static ENCODER: std::cell::RefCell<Option<payload::Encoder>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn prepare_one(s: &Span) -> Result<Prepared> {
+    ENCODER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let enc = match slot.as_mut() {
+            Some(e) => e,
+            None => slot.insert(payload::Encoder::new()?),
+        };
+        let mut out = Vec::new();
+        for bit in PAYLOAD_FIELDS {
+            if let Some(raw) = payload_field(s, bit) {
+                out.push(Stored {
+                    bit,
+                    hash: payload::hash(raw),
+                    data: enc.compress(raw)?,
+                });
+            }
+        }
+        Ok(out)
+    })
 }
 
 /// Where a batch's payload is stored: an existing entry, or the `k`-th new one.
