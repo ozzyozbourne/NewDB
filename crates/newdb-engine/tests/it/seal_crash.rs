@@ -66,6 +66,18 @@ fn crash_between_layout_writes_and_manifest_update_recovers() {
         db.close().unwrap();
         let old_manifest = fs::read(dir.path().join("MANIFEST")).unwrap();
         let before = listed(dir.path());
+        // Sealing deletes payloads.blob only after MANIFEST lists the partition, so every
+        // crash before that leaves it: keep it to put back.
+        let unsealed: Vec<PathBuf> = partition_dirs(dir.path())
+            .into_iter()
+            .filter(|p| !before.iter().any(|n| p.ends_with(n)))
+            .collect();
+        assert_eq!(
+            unsealed.len(),
+            1,
+            "{what}: unsealed partitions {unsealed:?}"
+        );
+        let blob = fs::read(unsealed[0].join("payloads.blob")).unwrap();
 
         let db = open(&dir, &clock);
         db.seal_active().unwrap();
@@ -75,9 +87,12 @@ fn crash_between_layout_writes_and_manifest_update_recovers() {
         assert_eq!(sealed.len(), 1, "{what}: seal_active listed {sealed:?}");
         let part = dir.path().join(sealed[0]);
 
-        // Put the disk back into the crash state.
+        // Put the disk back into the crash state. payloads.sealed stays, as a crash after
+        // writing it leaves it.
         let new_manifest = fs::read(dir.path().join("MANIFEST")).unwrap();
         fs::write(dir.path().join("MANIFEST"), &old_manifest).unwrap();
+        assert_eq!(part, unsealed[0], "{what}");
+        fs::write(part.join("payloads.blob"), &blob).unwrap();
         match crash {
             Crash::LayoutsDone => {}
             Crash::ManifestTmp => {
