@@ -85,19 +85,29 @@ fn cost_of(n: usize) -> Cost {
 impl Builder {
     /// All run candidates of the partition so far, newest first.
     pub fn runs(&self) -> (Vec<RunSummary>, Cost) {
-        let out: Vec<RunSummary> = self
-            .runs
-            .iter()
-            .map(|Reverse((_, t, s, p))| self.spans[&(*p, *t, *s)].sum)
-            .collect();
+        let out: Vec<RunSummary> = self.runs_newest().copied().collect();
         let cost = cost_of(out.len());
         (out, cost)
+    }
+
+    /// The same runs as [`Builder::runs`], in the same order, without copying: each item
+    /// costs one ordered-set step and one hash lookup, so newest-N reads N runs however
+    /// many the partition holds. Charge `cost_of(n)` for the `n` taken.
+    pub fn runs_newest(&self) -> impl Iterator<Item = &RunSummary> + '_ {
+        self.runs
+            .iter()
+            .map(|Reverse((_, t, s, p))| &self.spans[&(*p, *t, *s)].sum)
     }
 
     /// Positions in [`Builder::runs`] of summaries with status error, ascending.
     pub fn error_positions(&self) -> (Vec<u32>, Cost) {
         let (runs, cost) = self.runs();
         (error_positions(&runs), cost)
+    }
+
+    /// Cost of reading `n` summaries, for `ReadStats`.
+    pub fn cost_of(&self, n: usize) -> Cost {
+        cost_of(n)
     }
 }
 
