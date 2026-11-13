@@ -25,6 +25,7 @@
 //! - Every reader method returns, besides its answer, how many records it looked at and
 //!   how many bytes it touched, through [`Cost`], so the engine can fill `ReadStats`.
 
+mod file;
 pub mod fts;
 pub mod runs_by_time;
 pub mod trace_clustered;
