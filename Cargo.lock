@@ -295,6 +295,7 @@ name = "newdb-cli"
 version = "0.1.0"
 dependencies = [
  "newdb-engine",
+ "newdb-layouts",
  "newdb-otlp",
  "newdb-server",
  "newdb-testkit",

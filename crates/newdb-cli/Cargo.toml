@@ -17,3 +17,6 @@ newdb-otlp = { workspace = true }
 newdb-server = { workspace = true }
 newdb-tools = { workspace = true }
 newdb-testkit = { workspace = true }
+
+[dev-dependencies]
+newdb-layouts = { workspace = true }

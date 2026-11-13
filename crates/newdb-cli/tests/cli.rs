@@ -161,13 +161,9 @@ fn bench_on_a_real_db_seals_and_inspect_verify_rebuild_check_it() {
         row.split_whitespace().nth(2) == Some(&report.posts.to_string()[..]),
         "{inspect}"
     );
-    for layout in [
-        "trace_clustered.v1",
-        "runs_by_time.v1",
-        "trace_filter.v1",
-        "fts.v1",
-    ] {
-        assert!(row.contains(layout), "{layout}:\n{inspect}");
+    for def in newdb_layouts::LAYOUTS {
+        let layout = format!("{}.v{}", def.name, def.version);
+        assert!(row.contains(&layout), "{layout}:\n{inspect}");
     }
     assert!(inspect.contains("spans per trace: p50"), "{inspect}");
 
@@ -191,7 +187,12 @@ fn bench_on_a_real_db_seals_and_inspect_verify_rebuild_check_it() {
     // Damage one byte of a sealed layout file: verify reports it and exits 1.
     let layouts = std::fs::read_dir(data)
         .unwrap()
-        .map(|e| e.unwrap().path().join("layouts/runs_by_time.v1"))
+        .map(|e| {
+            e.unwrap().path().join(format!(
+                "layouts/runs_by_time.v{}",
+                newdb_layouts::runs_by_time::VERSION
+            ))
+        })
         .find(|p| p.is_dir())
         .unwrap();
     let file = std::fs::read_dir(&layouts)
