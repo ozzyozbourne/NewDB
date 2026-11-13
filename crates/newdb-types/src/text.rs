@@ -11,41 +11,57 @@
 
 pub const MAX_TOKEN_LEN: usize = 64;
 
-/// Calls `f` with each token of `text`, in order, duplicates included.
-pub fn for_each_token(text: &[u8], mut f: impl FnMut(&[u8])) {
-    let mut buf: Vec<u8> = Vec::with_capacity(MAX_TOKEN_LEN);
-    let mut too_long = false;
-    let mut flush = |buf: &mut Vec<u8>, too_long: &mut bool| {
-        if !buf.is_empty() && !*too_long {
-            f(buf);
-        }
-        buf.clear();
-        *too_long = false;
-    };
+/// Bytes that belong to tokens: ASCII letters, ASCII digits and every byte >= 0x80.
+const TOKEN_BYTE: [bool; 256] = {
+    let mut t = [false; 256];
     let mut i = 0;
-    while i < text.len() {
+    while i < 256 {
+        let b = i as u8;
+        t[i] = b.is_ascii_alphanumeric() || b >= 0x80;
+        i += 1;
+    }
+    t
+};
+
+/// Calls `f` with each token of `text`, in order, duplicates included.
+///
+/// Tokens without ASCII uppercase letters are passed as slices of `text`; only tokens that
+/// need lowercasing are copied (into a stack buffer).
+pub fn for_each_token(text: &[u8], mut f: impl FnMut(&[u8])) {
+    let mut buf = [0u8; MAX_TOKEN_LEN];
+    let n = text.len();
+    let mut i = 0;
+    while i < n {
         let b = text[i];
-        if b == b'\\' && i + 1 < text.len() {
-            flush(&mut buf, &mut too_long);
+        if TOKEN_BYTE[b as usize] {
+            let start = i;
+            let mut upper = false;
+            while i < n && TOKEN_BYTE[text[i] as usize] {
+                upper |= text[i].is_ascii_uppercase();
+                i += 1;
+            }
+            let tok = &text[start..i];
+            if tok.len() > MAX_TOKEN_LEN {
+                continue;
+            }
+            if upper {
+                let out = &mut buf[..tok.len()];
+                out.copy_from_slice(tok);
+                out.make_ascii_lowercase();
+                f(out);
+            } else {
+                f(tok);
+            }
+        } else if b == b'\\' && i + 1 < n {
             i += match text[i + 1] {
                 b'u' => 6,
                 b'n' | b't' | b'r' | b'b' | b'f' | b'"' | b'\\' | b'/' => 2,
                 _ => 1,
             };
-            continue;
-        }
-        if b.is_ascii_alphanumeric() || b >= 0x80 {
-            if buf.len() < MAX_TOKEN_LEN {
-                buf.push(b.to_ascii_lowercase());
-            } else {
-                too_long = true;
-            }
         } else {
-            flush(&mut buf, &mut too_long);
+            i += 1;
         }
-        i += 1;
     }
-    flush(&mut buf, &mut too_long);
 }
 
 /// The distinct tokens of `text`, sorted.
@@ -96,5 +112,79 @@ mod tests {
     #[test]
     fn tokens_are_sorted_and_distinct() {
         assert_eq!(tokens(b"b a B a"), [b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    /// The original byte-at-a-time implementation, kept as the reference.
+    fn reference(text: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut too_long = false;
+        let mut flush = |buf: &mut Vec<u8>, too_long: &mut bool| {
+            if !buf.is_empty() && !*too_long {
+                out.push(buf.clone());
+            }
+            buf.clear();
+            *too_long = false;
+        };
+        let mut i = 0;
+        while i < text.len() {
+            let b = text[i];
+            if b == b'\\' && i + 1 < text.len() {
+                flush(&mut buf, &mut too_long);
+                i += match text[i + 1] {
+                    b'u' => 6,
+                    b'n' | b't' | b'r' | b'b' | b'f' | b'"' | b'\\' | b'/' => 2,
+                    _ => 1,
+                };
+                continue;
+            }
+            if b.is_ascii_alphanumeric() || b >= 0x80 {
+                if buf.len() < MAX_TOKEN_LEN {
+                    buf.push(b.to_ascii_lowercase());
+                } else {
+                    too_long = true;
+                }
+            } else {
+                flush(&mut buf, &mut too_long);
+            }
+            i += 1;
+        }
+        flush(&mut buf, &mut too_long);
+        out
+    }
+
+    #[test]
+    fn matches_the_reference_on_random_inputs() {
+        // Bytes chosen to hit every branch: case, digits, UTF-8, escapes, separators, and
+        // long runs around MAX_TOKEN_LEN.
+        const ALPHABET: &[u8] = b"aZu9n\\\\\\\\\" /tX\xc3\xa9\x80 ,:{}";
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for case in 0..20_000 {
+            let len = (next() % 200) as usize;
+            let mut text = Vec::with_capacity(len);
+            while text.len() < len {
+                if next() % 16 == 0 {
+                    let run = 60 + (next() % 8) as usize;
+                    let c = if next() % 2 == 0 { b'a' } else { b'Q' };
+                    text.extend(std::iter::repeat_n(c, run));
+                } else {
+                    text.push(ALPHABET[(next() % ALPHABET.len() as u64) as usize]);
+                }
+            }
+            let mut got = Vec::new();
+            for_each_token(&text, |t| got.push(t.to_vec()));
+            assert_eq!(
+                got,
+                reference(&text),
+                "case {case}: {:?}",
+                String::from_utf8_lossy(&text)
+            );
+        }
     }
 }
