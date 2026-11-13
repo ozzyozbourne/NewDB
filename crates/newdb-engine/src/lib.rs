@@ -12,7 +12,9 @@
 mod admin;
 mod files;
 mod part;
+mod pool;
 mod query;
+mod reframe;
 #[cfg(test)]
 mod tests;
 mod writer;
@@ -150,6 +152,8 @@ pub struct Db {
     /// `None` when read-only.
     tx: Option<Sender<Msg>>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// The background re-framing thread; `None` when read-only.
+    reframer: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// State shared by the handle, the readers and the writer thread.
@@ -165,6 +169,8 @@ pub(crate) struct Inner {
     pub visible: writer::Visible,
     /// Recent read durations per operation, for `inspect`.
     reads: Mutex<HashMap<&'static str, VecDeque<u64>>>,
+    /// Sealed partitions whose payloads are still to move into payloads.sealed.
+    pub reframe: reframe::Queue,
     /// Held for the database's lifetime so only one process writes.
     _lock: Option<File>,
 }
@@ -259,12 +265,18 @@ impl Db {
                 manifest::write(&path, &manifest)?;
             }
             remove_dir_if_exists(&trash)?;
-            // A seal that crashed after MANIFEST listed the partition but before it
-            // deleted payloads.blob, which payloads.sealed replaces.
+            // Re-framing that crashed: before renaming payloads.sealed into place (its
+            // .tmp), or after but before deleting the payloads.blob it replaces.
             for e in &manifest.partitions {
                 let dir = path.join(&e.name);
-                if dir.join(files::SEALED_PAYLOADS).exists() && dir.join(files::PAYLOADS).exists() {
-                    fs::remove_file(dir.join(files::PAYLOADS))?;
+                let tmp = dir.join(files::SEALED_PAYLOADS_TMP);
+                let blob = dir.join(files::PAYLOADS);
+                let done = dir.join(files::SEALED_PAYLOADS).exists();
+                if tmp.exists() || (done && blob.exists()) {
+                    files::remove_file_if_exists(&tmp)?;
+                    if done {
+                        files::remove_file_if_exists(&blob)?;
+                    }
                     files::sync_dir(&dir)?;
                 }
             }
@@ -318,6 +330,7 @@ impl Db {
             multi: RwLock::default(),
             visible: Default::default(),
             reads: Mutex::default(),
+            reframe: Default::default(),
             _lock: lock,
         });
         let sealed = inner.parts();
@@ -348,6 +361,7 @@ impl Db {
                 inner,
                 tx: None,
                 thread: Mutex::new(None),
+                reframer: Mutex::new(None),
             });
         }
         let mut w = Writer::open(
@@ -360,10 +374,20 @@ impl Db {
         let thread = std::thread::Builder::new()
             .name("newdb-writer".into())
             .spawn(move || w.run(rx))?;
+        for p in inner.parts() {
+            if p.sealed && !p.dir.join(files::SEALED_PAYLOADS).exists() {
+                inner.reframe.push(p.id);
+            }
+        }
+        let bg = inner.clone();
+        let reframer = std::thread::Builder::new()
+            .name("newdb-reframe".into())
+            .spawn(move || reframe::run(bg))?;
         Ok(Db {
             inner,
             tx: Some(tx),
             thread: Mutex::new(Some(thread)),
+            reframer: Mutex::new(Some(reframer)),
         })
     }
 
@@ -433,6 +457,17 @@ impl Db {
             t.join()
                 .map_err(|_| Error::Io(std::io::Error::other("writer thread panicked")))?;
             r?;
+        }
+        // Re-framing still running is abandoned; the next open queues it again.
+        let reframer = self
+            .reframer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(t) = reframer {
+            self.inner.reframe.stop();
+            t.join()
+                .map_err(|_| Error::Io(std::io::Error::other("re-framing thread panicked")))?;
         }
         Ok(())
     }

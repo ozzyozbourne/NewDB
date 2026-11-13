@@ -754,6 +754,7 @@ fn sealed_payloads_replace_the_blob_through_crashes() {
             oracle.ingest(c.to_vec()).unwrap();
             d.with(|db| db.ingest(c.to_vec())).unwrap();
         }
+        d.with(|db| db.inner.reframe.wait_idle());
         let info = d.with(|db| db.partitions().unwrap());
         let db = d.db.write().unwrap().take().unwrap();
         db.close().unwrap();
@@ -780,6 +781,7 @@ fn sealed_payloads_replace_the_blob_through_crashes() {
     let blob = std::fs::read(a.path().join(&active).join(PAYLOADS)).unwrap();
     let d = Driver::new(a.path(), 0, 0, 0);
     d.with(|db| db.seal_active()).unwrap();
+    d.with(|db| db.inner.reframe.wait_idle());
     let reference = std::fs::read(a.path().join(&active).join(SEALED_PAYLOADS)).unwrap();
     std::fs::write(a.path().join(&active).join(PAYLOADS), &blob).unwrap();
     d.reopen(true);
@@ -811,12 +813,32 @@ fn sealed_payloads_replace_the_blob_through_crashes() {
     assert!(!p.sealed && p.payload_bytes == blob_len);
     assert!(db_b.with(|db| db.inspect()).is_ok());
     db_b.with(|db| db.seal_active()).unwrap();
+    db_b.with(|db| db.inner.reframe.wait_idle());
     assert!(sealed_ok(b.path(), &active));
     let resealed = std::fs::read(b.path().join(&active).join(SEALED_PAYLOADS)).unwrap();
     assert!(resealed == reference, "reseal wrote different bytes");
     assert!(db_b.with(|db| db.verify().unwrap()).problems.is_empty());
     db_b.reopen(true);
     queries_agree(&oracle, &db_b, &posts);
+
+    // Re-framing that crashed before renaming its file into place: open removes the
+    // .tmp, the partition answers from payloads.blob, and re-framing runs again.
+    let c = TestDir::new("psl-tmp");
+    copy_dir(a.path(), c.path());
+    let dir = c.path().join(&active);
+    let mut torn = std::fs::read(dir.join(SEALED_PAYLOADS)).unwrap();
+    torn.truncate(torn.len() / 2);
+    std::fs::write(dir.join("payloads.sealed.tmp"), torn).unwrap();
+    std::fs::remove_file(dir.join(SEALED_PAYLOADS)).unwrap();
+    std::fs::write(dir.join(PAYLOADS), &blob).unwrap();
+    let db_c = Driver::new(c.path(), 0, 0, 0);
+    queries_agree(&oracle, &db_c, &posts);
+    db_c.with(|db| db.inner.reframe.wait_idle());
+    assert!(sealed_ok(c.path(), &active));
+    assert!(!dir.join("payloads.sealed.tmp").exists());
+    assert!(std::fs::read(dir.join(SEALED_PAYLOADS)).unwrap() == reference);
+    queries_agree(&oracle, &db_c, &posts);
+    assert!(db_c.with(|db| db.verify().unwrap()).problems.is_empty());
 
     // Damaged frame data is a verify problem.
     let file = a.path().join(&active).join(SEALED_PAYLOADS);

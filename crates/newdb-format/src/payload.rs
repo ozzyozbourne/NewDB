@@ -169,6 +169,62 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+thread_local! {
+    static CCTX: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Compresses `raw` at [`ZSTD_LEVEL`] with this thread's context.
+pub(crate) fn compress(raw: &[u8]) -> std::io::Result<Vec<u8>> {
+    CCTX.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let c = match slot.as_mut() {
+            Some(c) => c,
+            None => slot.insert(zstd::bulk::Compressor::new(ZSTD_LEVEL)?),
+        };
+        c.compress(raw)
+    })
+}
+
+/// Decompresses `data`, a frame of exactly `dst.len()` raw bytes, into `dst`.
+pub(crate) fn decompress_into(data: &[u8], dst: &mut [u8]) -> std::io::Result<()> {
+    DCTX.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let d = match slot.as_mut() {
+            Some(d) => d,
+            None => slot.insert(zstd::bulk::Decompressor::new()?),
+        };
+        match d.decompress_to_buffer(data, dst)? {
+            n if n == dst.len() => Ok(()),
+            _ => Err(std::io::Error::other("decompressed length differs")),
+        }
+    })
+}
+
+/// Decodes the payload `r` from `entry` (as [`decode`]) and appends its raw bytes to `out`.
+pub fn decode_append(entry: &[u8], r: PayloadRef, out: &mut Vec<u8>) -> Result<()> {
+    if entry.len() != ENTRY_HEADER_LEN + r.len as usize {
+        return Err(corrupt("payload: entry length does not match reference"));
+    }
+    let e = parse_entry_header(&entry[..ENTRY_HEADER_LEN], r.offset)?;
+    if e.r != r {
+        return Err(corrupt("payload: reference does not match entry header"));
+    }
+    let data = &entry[ENTRY_HEADER_LEN..];
+    match e.codec {
+        codec::RAW => out.extend_from_slice(data),
+        _ => {
+            let at = out.len();
+            out.resize(at + r.raw_len as usize, 0);
+            if let Err(e) = decompress_into(data, &mut out[at..]) {
+                out.truncate(at);
+                return Err(corrupt(format!("payload: zstd: {e}")));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn decompress(data: &[u8], capacity: usize) -> std::io::Result<Vec<u8>> {
     DCTX.with(|cell| {
         let mut slot = cell.borrow_mut();

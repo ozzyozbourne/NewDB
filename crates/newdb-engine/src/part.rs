@@ -337,7 +337,7 @@ impl<'a> BlobRef<'a> {
             BlobRef::Sealed(s) => match self.locate(r)? {
                 Some((_, loc)) => {
                     let raw = s.decompress(loc.frame as usize)?;
-                    Ok(sealed::Sealed::slice(&raw, loc)?.to_vec())
+                    Ok(sealed::Sealed::get(&raw, loc)?.to_vec())
                 }
                 None => Err(corrupt("payloads.sealed: lookup")),
             },
@@ -391,7 +391,7 @@ impl<'a> Payloads<'a> {
                 }
             }
         }
-        Ok(sealed::Sealed::slice(&self.frames[&key], loc)?.to_vec())
+        Ok(sealed::Sealed::get(&self.frames[&key], loc)?.to_vec())
     }
 }
 
@@ -765,29 +765,18 @@ const REPLAY_FRAME_CACHE: usize = 64 << 20;
 pub(crate) fn replay(dir: &Path, mode: Mode, sink: &mut dyn FnMut(&Batch<'_>)) -> Result<Replay> {
     let strict = mode != Mode::Recover;
     let log_bytes = files::map(&dir.join(LOG))?;
-    // A sealed partition reads its payloads from `payloads.sealed` when sealing wrote it
-    // (its `payloads.blob` may be gone). The active partition ignores a `payloads.sealed`
-    // left by a seal that crashed before MANIFEST listed the partition.
-    let sealed_bytes = match strict {
-        true => map_existing(&dir.join(SEALED_PAYLOADS))?,
-        false => None,
-    };
-    let pay_bytes = match sealed_bytes {
-        Some(_) => Bytes::Owned(Vec::new()),
-        None => files::map(&dir.join(PAYLOADS))?,
+    // A sealed partition reads its payloads from `payloads.sealed` once re-framing wrote
+    // it (its `payloads.blob` may be gone). The active partition never has one.
+    let (sealed_bytes, pay_bytes) = match strict {
+        true => payload_files(dir)?,
+        false => (None, files::map(&dir.join(PAYLOADS))?),
     };
     let mut dedup: HashMap<_, Vec<_>> = HashMap::new();
     let (blob, source) = match &sealed_bytes {
         Some(b) => {
             let s = sealed::Sealed::open(b)?;
             if mode == Mode::Verify {
-                for i in 0..s.frame_count() {
-                    s.check_frame(i, &s.decompress(i)?)?;
-                }
-                for i in 0..s.entry_count() {
-                    let loc = s.entry(i).1;
-                    sealed::Sealed::slice(&s.decompress(loc.frame as usize)?, loc)?;
-                }
+                s.verify()?;
             }
             (&[][..], BlobRef::Sealed(s))
         }
@@ -893,79 +882,119 @@ pub(crate) fn replay(dir: &Path, mode: Mode, sink: &mut dyn FnMut(&Batch<'_>)) -
 pub(crate) const FRAME_TARGET: usize = 64 << 10;
 
 /// Plans `payloads.sealed` from a partition's merged headers in `trace_clustered` order
-/// (`spans`) and its `payloads.blob`. Deterministic. Frames hold, in order:
+/// (`spans`) and every payload its log refers to (`all`, sorted by offset, unique).
+/// Deterministic. Frames hold, in order:
 /// - each trace's own payloads, trace by trace;
 /// - payloads several traces share (deduplicated, such as a common prompt), one per
 ///   frame, so a small trace never decompresses another trace's frame to read one;
-/// - every other entry of the blob (payloads a later post replaced, which replaying the
-///   log still reads), in blob order.
-pub(crate) fn plan_sealed(
-    spans: &[SpanHeader],
-    blob: &[u8],
-    target: usize,
-) -> Result<sealed::Plan> {
-    let refs_of = |trace: &[SpanHeader]| {
-        let mut seen = HashSet::new();
-        let mut refs = Vec::new();
+/// - the other payloads of the log (ones a later post replaced, which replaying the log
+///   still reads), in offset order.
+pub(crate) fn plan_sealed(spans: &[SpanHeader], all: &[PayloadRef], target: usize) -> sealed::Plan {
+    let refs_of = |trace: &[SpanHeader], out: &mut Vec<PayloadRef>| {
+        out.clear();
         for h in trace {
             for bit in PAYLOAD_FIELDS {
                 let r = payload_ref(h, bit);
-                if h.has(bit) && seen.insert(r.offset) {
-                    refs.push(r);
+                if h.has(bit) && !out.iter().any(|o| o.offset == r.offset) {
+                    out.push(r);
                 }
             }
         }
-        refs
     };
     let traces = || spans.chunk_by(|a, b| a.trace_id == b.trace_id);
-    let mut uses: HashMap<u64, u32> = HashMap::new();
+    let mut refs = Vec::new();
+    let mut uses: HashMap<u64, u32> = HashMap::with_capacity(all.len());
     for trace in traces() {
-        for r in refs_of(trace) {
+        refs_of(trace, &mut refs);
+        for r in &refs {
             *uses.entry(r.offset).or_default() += 1;
         }
     }
     let mut plan = sealed::Plan::new(target);
-    let mut added = HashSet::new();
     let mut shared = Vec::new();
+    let mut own = Vec::new();
     for trace in traces() {
-        let (own, many): (Vec<_>, Vec<_>) = refs_of(trace)
-            .into_iter()
-            .partition(|r| uses[&r.offset] == 1);
-        shared.extend(many.into_iter().filter(|r| added.insert(r.offset)));
-        plan.start_group(own.iter().map(|r| r.raw_len as usize).sum());
-        for r in own {
-            added.insert(r.offset);
-            plan.add(r);
+        refs_of(trace, &mut refs);
+        own.clear();
+        for r in &refs {
+            match uses.get_mut(&r.offset) {
+                Some(1) => own.push(*r),
+                // The first trace using a shared payload claims it; 0 marks it claimed.
+                Some(n) if *n > 1 => {
+                    *n = 0;
+                    shared.push(*r);
+                }
+                _ => {}
+            }
         }
+        plan.start_group(own.iter().map(|r| r.raw_len as usize).sum());
+        own.iter().for_each(|r| plan.add(*r));
     }
     shared.into_iter().for_each(|r| plan.add_alone(r));
-    let mut scan = payload::Scan::new(blob)?;
-    for e in scan.by_ref() {
-        if added.insert(e.r.offset) {
-            plan.add(e.r);
+    for r in all {
+        if !uses.contains_key(&r.offset) {
+            plan.add(*r);
         }
     }
-    if scan.torn() {
-        return Err(corrupt("payloads.blob is torn"));
-    }
-    Ok(plan.finish())
+    plan.finish()
 }
 
-/// Writes and fsyncs `payloads.sealed` for a partition whose layouts are on disk, from
-/// the first `pay_len` bytes of its `payloads.blob` (not the directory).
-pub(crate) fn write_sealed_payloads(dir: &Path, pay_len: u64) -> Result<()> {
+/// Every payload a partition's log refers to, sorted by offset, unique.
+fn log_payloads(dir: &Path) -> Result<Vec<PayloadRef>> {
+    let bytes = files::map(&dir.join(LOG))?;
+    let mut out = Vec::new();
+    for rec in log::Reader::new(&bytes)? {
+        if rec.kind == log::kind::SPAN_POST {
+            let h = rec.post()?;
+            for bit in PAYLOAD_FIELDS {
+                if h.has(bit) {
+                    out.push(payload_ref(&h, bit));
+                }
+            }
+        }
+    }
+    out.sort_unstable_by_key(|r| r.offset);
+    out.dedup_by_key(|r| r.offset);
+    Ok(out)
+}
+
+/// Writes `payloads.sealed` for a sealed partition to `out` and fsyncs it (not the
+/// directory). Payloads are read from `payloads.blob` with `pread`, so the blob is not
+/// mapped, and frames are built on the read pool a few at a time and written in order,
+/// so memory stays bounded. Stops with an error when `stop` returns true.
+pub(crate) fn write_sealed_payloads(dir: &Path, out: &Path, stop: &dyn Fn() -> bool) -> Result<()> {
     let set = map_layout(dir, trace_clustered::NAME, trace_clustered::VERSION)?;
     let files: Vec<(&str, &[u8])> = set.iter().map(|(n, b)| (n.as_str(), &b[..])).collect();
     let tc = trace_clustered::Reader::open(FileSet { files: &files })?;
-    let map = files::map(&dir.join(PAYLOADS))?;
-    let blob = map
-        .get(..pay_len as usize)
-        .ok_or_else(|| corrupt("payloads.blob is shorter than committed"))?;
-    let plan = plan_sealed(tc.spans(), blob, FRAME_TARGET)?;
-    let frames = sealed::build(&plan, cores(), &|r| payload::read(blob, r))?;
-    let mut out = std::io::BufWriter::new(File::create(dir.join(SEALED_PAYLOADS))?);
-    sealed::write(&plan, &frames, &mut out)?;
-    out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    let plan = plan_sealed(tc.spans(), &log_payloads(dir)?, FRAME_TARGET);
+    drop(set);
+    let blob = File::open(dir.join(PAYLOADS))?;
+    let blob_len = blob.metadata()?.len();
+    let build = |i: usize| {
+        let mut entry = Vec::new();
+        sealed::build_frame(&plan, i, &mut |r, out| {
+            let range = payload::entry_range(r, blob_len)?;
+            entry.resize(range.len(), 0);
+            blob.read_exact_at(&mut entry, range.start as u64)?;
+            payload::decode_append(&entry, r, out)
+        })
+    };
+    let chunk = 4 * (crate::pool::workers() + 1);
+    let n = plan.frame_count();
+    let frames = (0..n.div_ceil(chunk)).flat_map(|c| {
+        let from = c * chunk;
+        let built: Vec<Result<sealed::FrameData>> = match stop() {
+            true => vec![Err(Error::Io(std::io::Error::other("re-framing stopped")))],
+            false => crate::pool::each((n - from).min(chunk), &|k| build(from + k))
+                .into_iter()
+                .map(|f| f.unwrap_or_else(|| Err(corrupt("re-framing thread panicked"))))
+                .collect(),
+        };
+        built
+    });
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, File::create(out)?);
+    sealed::write(&plan, frames, &mut w)?;
+    w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     Ok(())
 }
 
@@ -978,25 +1007,42 @@ fn map_existing(path: &Path) -> Result<Option<Bytes>> {
     }
 }
 
-/// A sealed partition's payloads: `payloads.sealed` once sealing has written it, else
-/// `payloads.blob` (partitions sealed before `payloads.sealed` existed).
-fn open_payloads(dir: &Path) -> Result<Blob> {
-    if let Some(b) = map_existing(&dir.join(SEALED_PAYLOADS))? {
-        let layout = sealed::Sealed::open(&b)?.layout();
-        return Ok(Blob::Sealed(b, layout));
+/// A sealed partition's payload files: `(payloads.sealed, payloads.blob)`, the blob empty
+/// when the sealed file exists. Re-framing renames payloads.sealed into place before it
+/// deletes the blob, so a blob that vanished means payloads.sealed is there now.
+fn payload_files(dir: &Path) -> Result<(Option<Bytes>, Bytes)> {
+    for _ in 0..2 {
+        if let Some(b) = map_existing(&dir.join(SEALED_PAYLOADS))? {
+            return Ok((Some(b), Bytes::Owned(Vec::new())));
+        }
+        if let Some(b) = map_existing(&dir.join(PAYLOADS))? {
+            return Ok((None, b));
+        }
     }
-    let blob = files::map(&dir.join(PAYLOADS))?;
-    payload::check_header(&blob)?;
-    Ok(Blob::Map(blob))
+    Err(corrupt(format!("{}: no payload file", dir.display())))
+}
+
+/// A sealed partition's payloads: `payloads.sealed` once re-framing has written it, else
+/// `payloads.blob`.
+fn open_payloads(dir: &Path) -> Result<Blob> {
+    match payload_files(dir)? {
+        (Some(b), _) => {
+            let layout = sealed::Sealed::open(&b)?.layout();
+            Ok(Blob::Sealed(b, layout))
+        }
+        (None, blob) => {
+            payload::check_header(&blob)?;
+            Ok(Blob::Map(blob))
+        }
+    }
 }
 
 /// Uncompressed size of every stored payload of a partition. Only a partition listed in
-/// MANIFEST (`sealed`) reads `payloads.sealed`; next to an unsealed one it is left over
-/// from a crashed seal.
+/// MANIFEST (`sealed`) can have `payloads.sealed`.
 pub(crate) fn payload_sizes(dir: &Path, sealed: bool) -> Result<Vec<u64>> {
-    let file = match sealed {
-        true => map_existing(&dir.join(SEALED_PAYLOADS))?,
-        false => None,
+    let (file, blob) = match sealed {
+        true => payload_files(dir)?,
+        false => (None, files::map(&dir.join(PAYLOADS))?),
     };
     if let Some(b) = file {
         let s = sealed::Sealed::open(&b)?;
@@ -1004,8 +1050,7 @@ pub(crate) fn payload_sizes(dir: &Path, sealed: bool) -> Result<Vec<u64>> {
             .map(|i| s.entry(i).1.len as u64)
             .collect());
     }
-    let pay = files::map(&dir.join(PAYLOADS))?;
-    Ok(payload::Scan::new(&pay)?
+    Ok(payload::Scan::new(&blob)?
         .map(|e| e.r.raw_len as u64)
         .collect())
 }
@@ -1027,12 +1072,21 @@ fn map_layout(dir: &Path, name: &str, version: u32) -> Result<Vec<(String, Bytes
 
 /// Opens a sealed partition listed in MANIFEST.
 pub(crate) fn open_sealed(dir: &Path, e: &PartitionEntry) -> Result<Fixed> {
+    open_fixed(dir, &e.layouts, Stats::from_entry(e))
+}
+
+/// Opens a sealed partition again, as after re-framing: the same layout versions and
+/// counters, and the payload files on disk now.
+pub(crate) fn reopen_sealed(dir: &Path, f: &Fixed) -> Result<Fixed> {
+    open_fixed(dir, &f.versions, f.stats.clone())
+}
+
+fn open_fixed(dir: &Path, versions: &[(String, u32)], stats: Stats) -> Result<Fixed> {
     let strings = Strings::load(&files::map(&dir.join(STRINGS))?)?;
     let blob = open_payloads(dir)?;
     let mut sets: FileSets = Vec::new();
     for def in LAYOUTS {
-        if !e
-            .layouts
+        if !versions
             .iter()
             .any(|(n, v)| n == def.name && *v == def.version)
         {
@@ -1053,9 +1107,9 @@ pub(crate) fn open_sealed(dir: &Path, e: &PartitionEntry) -> Result<Fixed> {
     Ok(Fixed {
         strings,
         blob,
-        stats: Stats::from_entry(e),
+        stats,
         layouts,
-        versions: e.layouts.clone(),
+        versions: versions.to_vec(),
         overlap: match fs::read(dir.join(OVERLAP)) {
             Ok(b) => Some(overlap::decode(&b)?),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,

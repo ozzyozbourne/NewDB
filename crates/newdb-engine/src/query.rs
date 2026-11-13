@@ -12,13 +12,13 @@ use newdb_layouts::{Cost, fts};
 use newdb_types::header::field::{END, ERROR, INPUTS, MODEL, NAME, OUTPUTS, PARENT, SESSION};
 use newdb_types::text::tokens;
 use newdb_types::{
-    Error, PayloadRef, Read, ReadStats, Result, Run, RunKey, RunQuery, RunSummary, RunType,
-    SearchHit, SearchQuery, Span, SpanHeader, Status, TraceId, TraceQuery,
+    PayloadRef, Read, ReadStats, Result, Run, RunKey, RunQuery, RunSummary, RunType, SearchHit,
+    SearchQuery, Span, SpanHeader, Status, TraceId, TraceQuery,
 };
 
 use crate::part::{
-    ALL_PAYLOADS, BlobRef, PAYLOAD_FIELDS, Payloads, View, cores, corrupt, payload_ref,
-    set_payload, summary_key, to_span,
+    ALL_PAYLOADS, BlobRef, PAYLOAD_FIELDS, Payloads, View, corrupt, payload_ref, set_payload,
+    summary_key, to_span,
 };
 
 /// One span merged across partitions, without payloads until [`load_payloads`].
@@ -132,111 +132,103 @@ fn load_payloads(
     Ok(())
 }
 
-/// Below this many payload bytes per thread, a trace load decompresses on one thread.
-const PARALLEL_PAYLOAD_BYTES: usize = 1 << 20;
+/// Below this many raw payload bytes, a trace load decodes on the calling thread only.
+const PARALLEL_PAYLOAD_BYTES: u64 = 256 << 10;
 
-/// One payload to read for `fill_payloads`: (span, field, partition, reference, where it
-/// lives in a sealed partition).
-type Job<'a> = (usize, u32, usize, PayloadRef, Option<(Sealed<'a>, Loc)>);
+/// One payload to read for `fill_payloads`: (span, field, partition, reference).
+type Job = (usize, u32, usize, PayloadRef);
 
-/// Work for one thread step: one `payloads.blob` entry, or one sealed frame with every
-/// job that reads from it. `(raw bytes to decompress, job indices)`.
-type Unit = (u64, Vec<usize>);
+/// Work for one task: one `payloads.blob` entry, or one sealed frame with every job that
+/// reads from it (and each job's place in the frame).
+struct Unit<'a> {
+    raw: u64,
+    frame: Option<(Sealed<'a>, u32)>,
+    jobs: Vec<(usize, Option<Loc>)>,
+}
 
-/// Decompresses `unit` and returns its jobs' payloads in order. A job that is its whole
-/// frame takes the frame's buffer; others copy their slice of it.
-fn read_unit(blobs: &[BlobRef<'_>], jobs: &[Job<'_>], unit: &Unit) -> Result<Vec<Vec<u8>>> {
-    let first = &jobs[unit.1[0]];
-    let Some((s, loc)) = first.4 else {
-        return Ok(vec![blobs[first.2].read(first.3)?]);
+/// Decodes `unit` and returns its jobs' payloads in order, each in its own buffer. A
+/// frame is decompressed once and its CRC checked once; a job that is its whole frame
+/// takes the frame's buffer.
+fn read_unit(blobs: &[BlobRef<'_>], jobs: &[Job], unit: &Unit<'_>) -> Result<Vec<Vec<u8>>> {
+    let Some((s, frame)) = unit.frame else {
+        let (_, _, pi, r) = jobs[unit.jobs[0].0];
+        return Ok(vec![blobs[pi].read(r)?]);
     };
-    let raw = s.decompress(loc.frame as usize)?;
-    if unit.1.len() == 1 && loc.at == 0 && loc.len as usize == raw.len() {
-        Sealed::slice(&raw, loc)?;
+    let raw = s.decompress(frame as usize)?;
+    if let [(_, Some(loc))] = unit.jobs[..]
+        && loc.at == 0
+        && loc.len as usize == raw.len()
+    {
         return Ok(vec![raw]);
     }
-    unit.1
+    unit.jobs
         .iter()
-        .map(|&j| match jobs[j].4 {
-            Some((_, loc)) => Ok(Sealed::slice(&raw, loc)?.to_vec()),
+        .map(|(_, loc)| match loc {
+            Some(loc) => Ok(Sealed::get(&raw, *loc)?.to_vec()),
             None => Err(corrupt("payload job without a frame")),
         })
         .collect()
 }
 
 /// Fills the payload fields in `mask` of every span. Payloads are read in units (a blob
-/// entry, or a sealed frame decompressed once for all its payloads). Decompression
-/// dominates large traces, so with enough bytes the units are spread over threads by
-/// size, largest first onto the least loaded thread, and the calling thread takes one
-/// share.
+/// entry, or a sealed frame decompressed once for all its payloads). With enough bytes the
+/// units run on the read pool, largest first, and the calling thread takes part; slicing
+/// and copying each payload into its span's buffer happen on the same task as the
+/// decompression.
 fn fill_payloads(
     blobs: &[BlobRef<'_>],
     merged: &mut [Merged],
     mask: u32,
     st: &mut ReadStats,
 ) -> Result<()> {
-    let mut jobs: Vec<Job<'_>> = Vec::new();
+    let mut jobs: Vec<Job> = Vec::new();
     for (i, m) in merged.iter().enumerate() {
         for bit in PAYLOAD_FIELDS {
             if mask & bit != 0
                 && let Some((pi, h)) = m.pieces().rev().find(|(_, h)| h.has(bit))
             {
-                let r = payload_ref(h, bit);
-                jobs.push((i, bit, *pi, r, blobs[*pi].locate(r)?));
+                jobs.push((i, bit, *pi, payload_ref(h, bit)));
             }
         }
     }
-    let mut units: Vec<Unit> = Vec::new();
+    let mut units: Vec<Unit<'_>> = Vec::new();
     let mut by_frame: HashMap<(usize, u32), usize> = HashMap::new();
-    for (j, job) in jobs.iter().enumerate() {
-        match job.4 {
-            None => units.push((job.3.raw_len as u64 + 64, vec![j])),
-            Some((s, loc)) => match by_frame.entry((job.2, loc.frame)) {
-                Entry::Occupied(e) => units[*e.get()].1.push(j),
+    for (j, &(_, _, pi, r)) in jobs.iter().enumerate() {
+        match blobs[pi].locate(r)? {
+            None => units.push(Unit {
+                raw: r.raw_len as u64 + 64,
+                frame: None,
+                jobs: vec![(j, None)],
+            }),
+            Some((s, loc)) => match by_frame.entry((pi, loc.frame)) {
+                Entry::Occupied(e) => units[*e.get()].jobs.push((j, Some(loc))),
                 Entry::Vacant(e) => {
                     e.insert(units.len());
-                    units.push((s.frame(loc.frame as usize).raw_len as u64 + 64, vec![j]));
+                    units.push(Unit {
+                        raw: s.frame(loc.frame as usize).raw_len as u64 + 64,
+                        frame: Some((s, loc.frame)),
+                        jobs: vec![(j, Some(loc))],
+                    });
                 }
             },
         }
     }
-    let raw: u64 = units.iter().map(|u| u.0).sum();
-    let threads = cores()
-        .min(8)
-        .min(raw as usize / PARALLEL_PAYLOAD_BYTES + 1)
-        .min(units.len());
-    let mut bins: Vec<Vec<Unit>> = vec![Vec::new(); threads.max(1)];
-    if threads <= 1 {
-        bins[0] = units;
-    } else {
-        units.sort_unstable_by_key(|u| Reverse(u.0));
-        let mut load = vec![0u64; threads];
-        for u in units {
-            let b = (0..threads).min_by_key(|&b| load[b]).unwrap_or(0);
-            load[b] += u.0;
-            bins[b].push(u);
-        }
-    }
-    let read = |bin: &[Unit]| -> Result<Vec<Vec<Vec<u8>>>> {
-        bin.iter().map(|u| read_unit(blobs, &jobs, u)).collect()
-    };
-    let results: Vec<Result<Vec<Vec<Vec<u8>>>>> = std::thread::scope(|sc| {
-        let spawned: Vec<_> = bins[1..].iter().map(|b| sc.spawn(|| read(b))).collect();
-        let mut out = vec![read(&bins[0])];
-        for h in spawned {
-            out.push(h.join().unwrap_or_else(|_| {
-                Err(Error::Io(std::io::Error::other("payload thread panicked")))
-            }));
-        }
-        out
-    });
-    for (bin, bytes) in bins.iter().zip(results) {
-        for (unit, payloads) in bin.iter().zip(bytes?) {
-            for (&j, b) in unit.1.iter().zip(payloads) {
-                let (i, bit, ..) = jobs[j];
-                st.payload_bytes_decompressed += b.len() as u64;
-                set_payload(&mut merged[i].span, bit, b)?;
-            }
+    let total: u64 = units.iter().map(|u| u.raw).sum();
+    let results: Vec<Result<Vec<Vec<u8>>>> =
+        if units.len() > 1 && total >= PARALLEL_PAYLOAD_BYTES && crate::pool::workers() > 0 {
+            units.sort_unstable_by_key(|u| Reverse(u.raw));
+            crate::pool::each(units.len(), &|k| read_unit(blobs, &jobs, &units[k]))
+                .into_iter()
+                .map(|r| r.unwrap_or_else(|| Err(corrupt("payload task panicked"))))
+                .collect()
+        } else {
+            units.iter().map(|u| read_unit(blobs, &jobs, u)).collect()
+        };
+    for (unit, payloads) in units.iter().zip(results) {
+        for (&(j, _), b) in unit.jobs.iter().zip(payloads?) {
+            let (i, bit, ..) = jobs[j];
+            st.payload_bytes_decompressed += b.len() as u64;
+            set_payload(&mut merged[i].span, bit, b)?;
         }
     }
     Ok(())

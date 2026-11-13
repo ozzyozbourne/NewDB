@@ -38,7 +38,7 @@ use crate::files::{
 };
 use crate::part::{
     Blob, Body, Group, Layouts, Live, Mode, PARALLEL_APPLY, PAYLOAD_FIELDS, Part, Stats, Strings,
-    cores, corrupt, fts_shards, open_sealed, present, replay, write_sealed_payloads,
+    cores, corrupt, fts_shards, open_sealed, present, replay,
 };
 
 pub(crate) type Ack = Sender<Result<()>>;
@@ -448,7 +448,9 @@ impl Writer {
             let mut shared = a.overlap.clone();
             shared.sort_unstable();
             write_synced(&dir.join(OVERLAP), &overlap::encode(&shared))?;
-            write_sealed_payloads(&dir, a.pay_len)?;
+            // Re-framing writes payloads.sealed only after MANIFEST lists the partition;
+            // one here is left over from a crashed seal of an earlier build.
+            files::remove_file_if_exists(&dir.join(files::SEALED_PAYLOADS))?;
             sync_dir(&dir)?;
             entry(&a.part, &g.stats)
         };
@@ -462,10 +464,8 @@ impl Writer {
         if let Some(a) = a {
             self.inner.replace(sealed_part(&a.part, fixed));
         }
-        // Sealed queries, verify and rebuild read payloads.sealed now. Readers that still
-        // hold the active partition keep its open file. A blob left by a crash here is
-        // removed when the database next opens.
-        let _ = fs::remove_file(dir.join(PAYLOADS)).and_then(|_| File::open(&dir)?.sync_all());
+        // Payloads move into payloads.sealed in the background, off the writer.
+        self.inner.reframe.push(entry.id);
         Ok(())
     }
 
