@@ -108,11 +108,33 @@ impl Store for Driver {
 fn check(posts: &[Span], batch: usize, d: &Driver) {
     let oracle = Oracle::new();
     compare(&oracle, d, posts, batch).unwrap();
+    span_refs_agree(d, posts);
     d.reopen(false);
     queries_agree(&oracle, d, posts);
     d.reopen(true);
     queries_agree(&oracle, d, posts);
+    span_refs_agree(d, posts);
     d.reopen(false);
+}
+
+/// `Db`'s zero-copy `with_trace` returns the same spans as `Db::trace`, with and without
+/// payloads.
+fn span_refs_agree(d: &Driver, posts: &[Span]) {
+    let (tq, _, _) = standard_queries(posts);
+    for q in &tq {
+        for payloads in [true, false] {
+            let q = TraceQuery {
+                payloads,
+                ..q.clone()
+            };
+            d.with(|db| {
+                let mut owned = Vec::new();
+                db.with_trace(&q, &mut |s| owned = s.iter().map(|s| s.to_span()).collect())
+                    .unwrap();
+                assert_eq!(owned, db.trace(&q).unwrap().value, "{q:?}");
+            });
+        }
+    }
 }
 
 /// `compare` without ingesting: the standard queries plus deep pagination.

@@ -17,8 +17,8 @@ use hyper::{Method, Request, Response, StatusCode};
 use newdb_otlp::Normalizer;
 use newdb_otlp::json::write_str;
 use newdb_types::{
-    Error, ReadStats, Run, RunKey, RunQuery, RunType, SearchHit, SearchQuery, Span, SpanId, Status,
-    Store, TraceId, TraceQuery,
+    Error, ReadStats, Run, RunKey, RunQuery, RunType, SearchHit, SearchQuery, SpanId, SpanRef,
+    Status, Store, TraceId, TraceQuery,
 };
 
 use crate::query::{Params, micro};
@@ -310,26 +310,35 @@ impl App {
             payloads: p.bool("payloads").map_err(bad_request)?.unwrap_or(true),
             timings: stats,
         };
+        // The spans borrow the store's bytes only during the callback, so the JSON is
+        // written there; the stats come back after it.
         let t0 = Instant::now();
-        let read = self.store.trace(&q).map_err(store_error)?;
-        let store_ns = elapsed(t0);
-        if read.value.is_empty() {
+        let mut out: Option<(Vec<u8>, u64, Instant)> = None;
+        let read_stats = self
+            .store
+            .with_trace(&q, &mut |spans| {
+                if spans.is_empty() {
+                    return;
+                }
+                let (store_ns, t1) = (elapsed(t0), Instant::now());
+                let size: usize = spans.iter().map(payload_len).sum::<usize>() + 512 * spans.len();
+                let mut b = Vec::with_capacity(size + 256);
+                b.extend_from_slice(b"{\"project\":");
+                write_str(&mut b, &q.project);
+                b.extend_from_slice(b",\"trace_id\":");
+                write_str(&mut b, &trace_id.to_hex());
+                b.extend_from_slice(b",\"spans\":");
+                write_tree(&mut b, spans);
+                out = Some((b, store_ns, t1));
+            })
+            .map_err(store_error)?;
+        let Some((mut b, store_ns, t1)) = out else {
             return Err(fail(
                 StatusCode::NOT_FOUND,
                 format!("trace {id} not found in project {}", q.project),
             ));
-        }
-        let t1 = Instant::now();
-        let size: usize =
-            read.value.iter().map(payload_len).sum::<usize>() + 512 * read.value.len();
-        let mut b = Vec::with_capacity(size + 256);
-        b.extend_from_slice(b"{\"project\":");
-        write_str(&mut b, &q.project);
-        b.extend_from_slice(b",\"trace_id\":");
-        write_str(&mut b, &trace_id.to_hex());
-        b.extend_from_slice(b",\"spans\":");
-        write_tree(&mut b, &read.value);
-        finish(&mut b, stats.then_some(&read.stats), store_ns, t1);
+        };
+        finish(&mut b, stats.then_some(&read_stats), store_ns, t1);
         Ok(json(StatusCode::OK, b))
     }
 
@@ -439,11 +448,11 @@ fn elapsed(t: Instant) -> u64 {
     u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn payload_len(s: &Span) -> usize {
-    [&s.inputs, &s.outputs, &s.attributes, &s.events]
+fn payload_len(s: &SpanRef<'_>) -> usize {
+    [s.inputs, s.outputs, s.attributes, s.events]
         .into_iter()
         .flatten()
-        .map(Vec::len)
+        .map(<[u8]>::len)
         .sum()
 }
 
@@ -587,13 +596,13 @@ fn write_hit(b: &mut Vec<u8>, h: &SearchHit) {
 }
 
 /// Writes a span's fields and opens its `children` array; [`write_tree`] closes it.
-fn open_span(b: &mut Vec<u8>, s: &Span) {
+fn open_span(b: &mut Vec<u8>, s: &SpanRef<'_>) {
     b.extend_from_slice(b"{\"span_id\":");
     write_str(b, &s.span_id.to_hex());
     key(b, "parent_span_id");
     opt(b, s.parent_span_id, |b, p| write_str(b, &p.to_hex()));
     key(b, "name");
-    opt_str(b, s.name.as_deref());
+    opt_str(b, s.name);
     key(b, "start_ns");
     opt(b, s.start_ns, ns);
     key(b, "end_ns");
@@ -603,11 +612,11 @@ fn open_span(b: &mut Vec<u8>, s: &Span) {
     key(b, "run_type");
     opt_str(b, s.run_type.map(RunType::as_str));
     key(b, "model");
-    opt_str(b, s.model.as_deref());
+    opt_str(b, s.model);
     key(b, "provider");
-    opt_str(b, s.provider.as_deref());
+    opt_str(b, s.provider);
     key(b, "session");
-    opt_str(b, s.session.as_deref());
+    opt_str(b, s.session);
     key(b, "prompt_tokens");
     opt(b, s.prompt_tokens, |b, n| num(b, n.into()));
     key(b, "completion_tokens");
@@ -615,17 +624,17 @@ fn open_span(b: &mut Vec<u8>, s: &Span) {
     key(b, "cost_micro_usd");
     opt(b, s.cost_micro_usd, num);
     key(b, "error");
-    opt_str(b, s.error.as_deref());
+    opt_str(b, s.error);
     key(b, "version");
     num(b, s.version);
     key(b, "inputs");
-    raw(b, s.inputs.as_deref());
+    raw(b, s.inputs);
     key(b, "outputs");
-    raw(b, s.outputs.as_deref());
+    raw(b, s.outputs);
     key(b, "attributes");
-    raw(b, s.attributes.as_deref());
+    raw(b, s.attributes);
     key(b, "events");
-    raw(b, s.events.as_deref());
+    raw(b, s.events);
     b.extend_from_slice(b",\"children\":[");
 }
 
@@ -634,7 +643,7 @@ fn open_span(b: &mut Vec<u8>, s: &Span) {
 /// parent; children keep the store's order. Spans in a parent cycle are cut at the first
 /// one in store order, which goes to the top level, so every span appears exactly once.
 /// Iterative, so a very deep trace cannot overflow the stack.
-fn write_tree(b: &mut Vec<u8>, spans: &[Span]) {
+fn write_tree(b: &mut Vec<u8>, spans: &[SpanRef<'_>]) {
     let index: HashMap<SpanId, usize> = spans
         .iter()
         .enumerate()
@@ -691,6 +700,7 @@ fn write_tree(b: &mut Vec<u8>, spans: &[Span]) {
 mod tests {
     use super::*;
     use newdb_otlp::json::Json;
+    use newdb_types::Span;
 
     fn span(id: u8, parent: Option<u8>) -> Span {
         Span {
@@ -700,10 +710,14 @@ mod tests {
         }
     }
 
+    fn refs(spans: &[Span]) -> Vec<SpanRef<'_>> {
+        spans.iter().map(Span::as_span_ref).collect()
+    }
+
     /// The forest as `id(children...)`.
     fn shape(spans: &[Span]) -> String {
         let mut b = Vec::new();
-        write_tree(&mut b, spans);
+        write_tree(&mut b, &refs(spans));
         fn walk(v: &Json, out: &mut String) {
             for (i, n) in v.as_array().unwrap().iter().enumerate() {
                 if i > 0 {
@@ -752,7 +766,7 @@ mod tests {
             })
             .collect();
         let mut b = Vec::new();
-        write_tree(&mut b, &deep);
+        write_tree(&mut b, &refs(&deep));
         assert!(b.ends_with(&("]}".repeat(100_000) + "]").into_bytes()));
         let text = String::from_utf8(b).unwrap();
         assert_eq!(text.matches("{\"span_id\":").count(), 100_000);

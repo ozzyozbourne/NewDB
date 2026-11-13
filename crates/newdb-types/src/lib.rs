@@ -19,7 +19,7 @@ pub mod text;
 
 pub use header::{PayloadRef, RunSummary, SpanHeader};
 pub use ids::{SpanId, TraceId};
-pub use span::{RunType, Span, Status};
+pub use span::{RunType, Span, SpanRef, Status};
 pub use store::{
     Read, ReadStats, Run, RunKey, RunQuery, SearchHit, SearchQuery, Store, TraceQuery,
 };

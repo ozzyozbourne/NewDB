@@ -55,6 +55,10 @@ let errors = db.runs(&RunQuery { status: Some(Status::Error), limit: 50, ..Defau
 let trace = db.trace(&TraceQuery { project: "default".into(), trace_id, payloads: true, timings: false })?;
 ```
 
+`db.with_trace(&query, &mut |spans| ...)` passes the same spans as `SpanRef`s that borrow
+their strings and payloads from the database instead of copying them; the HTTP server
+writes trace JSON this way.
+
 Every read returns its answer with stats (partitions touched, bytes read, records visited,
 optional per-phase timings).
 

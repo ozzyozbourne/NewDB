@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 
 use crate::Result;
 use crate::ids::{SpanId, TraceId};
-use crate::span::{RunType, Span, Status};
+use crate::span::{RunType, Span, SpanRef, Status};
 
 /// Cost of one read. Counters are always filled; `phases_ns` only when the query asked for
 /// timings; `allocations` only in bench builds with a counting allocator.
@@ -225,6 +225,21 @@ pub trait Store: Send + Sync {
     /// Every span of `(project, trace_id)`, each merged across all its posts, sorted by
     /// `(start_ns or 0, span_id)` ascending. Empty if the trace is unknown.
     fn trace(&self, query: &TraceQuery) -> Result<Read<Vec<Span>>>;
+
+    /// The spans [`Store::trace`] returns, passed to `f` as [`SpanRef`]s, which are valid
+    /// only during the call. Returns the read's stats. Stores that can lend their bytes
+    /// override this to skip allocating and copying every string and payload; the default
+    /// borrows from `trace`'s owned spans.
+    fn with_trace(
+        &self,
+        query: &TraceQuery,
+        f: &mut dyn FnMut(&[SpanRef<'_>]),
+    ) -> Result<ReadStats> {
+        let read = self.trace(query)?;
+        let refs: Vec<SpanRef<'_>> = read.value.iter().map(Span::as_span_ref).collect();
+        f(&refs);
+        Ok(read.stats)
+    }
 
     /// Runs passing the filters, newest first, at most `limit`.
     fn runs(&self, query: &RunQuery) -> Result<Read<Vec<Run>>>;

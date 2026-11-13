@@ -163,6 +163,91 @@ impl Span {
         self.attributes = None;
         self.events = None;
     }
+
+    /// This span as a [`SpanRef`] borrowing its strings and payloads.
+    pub fn as_span_ref(&self) -> SpanRef<'_> {
+        SpanRef {
+            project: &self.project,
+            trace_id: self.trace_id,
+            span_id: self.span_id,
+            parent_span_id: self.parent_span_id,
+            name: self.name.as_deref(),
+            start_ns: self.start_ns,
+            end_ns: self.end_ns,
+            status: self.status,
+            run_type: self.run_type,
+            model: self.model.as_deref(),
+            provider: self.provider.as_deref(),
+            session: self.session.as_deref(),
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            cost_micro_usd: self.cost_micro_usd,
+            inputs: self.inputs.as_deref(),
+            outputs: self.outputs.as_deref(),
+            attributes: self.attributes.as_deref(),
+            events: self.events.as_deref(),
+            error: self.error.as_deref(),
+            version: self.version,
+        }
+    }
+}
+
+/// A merged [`Span`] whose strings and payloads are borrowed, from the store's files and
+/// the frames one read decompressed. See [`crate::Store::with_trace`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpanRef<'a> {
+    pub project: &'a str,
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
+    pub parent_span_id: Option<SpanId>,
+    pub name: Option<&'a str>,
+    pub start_ns: Option<u64>,
+    pub end_ns: Option<u64>,
+    pub status: Option<Status>,
+    pub run_type: Option<RunType>,
+    pub model: Option<&'a str>,
+    pub provider: Option<&'a str>,
+    pub session: Option<&'a str>,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub cost_micro_usd: Option<u64>,
+    pub inputs: Option<&'a [u8]>,
+    pub outputs: Option<&'a [u8]>,
+    pub attributes: Option<&'a [u8]>,
+    pub events: Option<&'a [u8]>,
+    pub error: Option<&'a str>,
+    pub version: u64,
+}
+
+impl SpanRef<'_> {
+    /// The owned span, as [`crate::Store::trace`] returns it.
+    pub fn to_span(&self) -> Span {
+        let s = |v: Option<&str>| v.map(str::to_owned);
+        let b = |v: Option<&[u8]>| v.map(<[u8]>::to_vec);
+        Span {
+            project: self.project.to_owned(),
+            trace_id: self.trace_id,
+            span_id: self.span_id,
+            parent_span_id: self.parent_span_id,
+            name: s(self.name),
+            start_ns: self.start_ns,
+            end_ns: self.end_ns,
+            status: self.status,
+            run_type: self.run_type,
+            model: s(self.model),
+            provider: s(self.provider),
+            session: s(self.session),
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            cost_micro_usd: self.cost_micro_usd,
+            inputs: b(self.inputs),
+            outputs: b(self.outputs),
+            attributes: b(self.attributes),
+            events: b(self.events),
+            error: s(self.error),
+            version: self.version,
+        }
+    }
 }
 
 #[cfg(test)]

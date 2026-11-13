@@ -15,6 +15,7 @@ mod part;
 mod pool;
 mod query;
 mod reframe;
+mod span_ref;
 #[cfg(test)]
 mod tests;
 mod writer;
@@ -30,7 +31,8 @@ use std::time::{Duration, Instant};
 use newdb_format::{log, manifest};
 use newdb_layouts::LAYOUTS;
 use newdb_types::{
-    Error, Read, Result, Run, RunQuery, SearchHit, SearchQuery, Span, Store, TraceId, TraceQuery,
+    Error, Read, ReadStats, Result, Run, RunQuery, SearchHit, SearchQuery, Span, SpanRef, Store,
+    TraceId, TraceQuery,
 };
 
 use files::{LAYOUTS_DIR, LOCK, TRASH, dir_bytes, file_len, layout_dir_name, remove_dir_if_exists};
@@ -569,6 +571,14 @@ impl Store for Db {
 
     fn trace(&self, query: &TraceQuery) -> Result<Read<Vec<Span>>> {
         self.read("trace", |v| query::trace(v, query))
+    }
+
+    fn with_trace(
+        &self,
+        query: &TraceQuery,
+        f: &mut dyn FnMut(&[SpanRef<'_>]),
+    ) -> Result<ReadStats> {
+        self.read("trace", |v| span_ref::with_trace(v, query, f))
     }
 
     fn runs(&self, query: &RunQuery) -> Result<Read<Vec<Run>>> {
