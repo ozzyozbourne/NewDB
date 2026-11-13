@@ -146,7 +146,10 @@ pub(crate) fn cores() -> usize {
 }
 
 /// Smaller batches apply faster on one thread than the threads cost to start.
-const PARALLEL_APPLY: usize = 256;
+pub(crate) const PARALLEL_APPLY: usize = 256;
+
+/// One part of applying a batch, see [`Layouts::jobs`].
+pub(crate) type ApplyJob<'s> = Box<dyn FnOnce() + Send + 's>;
 
 const BUILT_IN: [&str; 4] = [
     trace_clustered::NAME,
@@ -177,6 +180,27 @@ impl Layouts {
     }
 
     pub fn apply_on(&mut self, b: &Batch<'_>, cores: usize) {
+        let [fts, tc, rest] = self.jobs(b);
+        if cores > 1 && b.headers.len() >= PARALLEL_APPLY {
+            std::thread::scope(|s| {
+                s.spawn(fts);
+                if cores > 2 {
+                    s.spawn(tc);
+                } else {
+                    tc();
+                }
+                rest();
+            });
+        } else {
+            tc();
+            fts();
+            rest();
+        }
+    }
+
+    /// A batch's work in independent parts that may run on different threads: `fts`,
+    /// `trace_clustered`, and the rest.
+    pub fn jobs<'s>(&'s mut self, b: &'s Batch<'_>) -> [ApplyJob<'s>; 3] {
         let Layouts {
             tc,
             runs,
@@ -184,28 +208,17 @@ impl Layouts {
             fts,
             extra,
         } = self;
-        let mut rest = |runs: &mut runs_by_time::Builder, filter: &mut trace_filter::Builder| {
-            runs.apply(b);
-            filter.apply(b);
-            for (_, x) in extra.iter_mut() {
-                x.get_mut().unwrap_or_else(|e| e.into_inner()).apply(b);
-            }
-        };
-        if cores > 1 && b.headers.len() >= PARALLEL_APPLY {
-            std::thread::scope(|s| {
-                s.spawn(|| fts.apply(b));
-                if cores > 2 {
-                    s.spawn(|| tc.apply(b));
-                } else {
-                    tc.apply(b);
+        [
+            Box::new(|| fts.apply(b)),
+            Box::new(|| tc.apply(b)),
+            Box::new(move || {
+                runs.apply(b);
+                filter.apply(b);
+                for (_, x) in extra.iter_mut() {
+                    x.get_mut().unwrap_or_else(|e| e.into_inner()).apply(b);
                 }
-                rest(runs, filter);
-            });
-        } else {
-            tc.apply(b);
-            fts.apply(b);
-            rest(runs, filter);
-        }
+            }),
+        ]
     }
 
     /// Every registered layout's files, in `LAYOUTS` order.
@@ -394,9 +407,6 @@ pub(crate) struct Live {
     pub stats: Stats,
     pub layouts: Layouts,
     pub keys: HashSet<Key>,
-    pub traces: HashSet<TraceId>,
-    /// Traces of this partition that sealed partitions have too, for `overlap.bin`.
-    pub overlap: Vec<TraceId>,
 }
 
 // One per partition, so the size difference between the variants does not matter.
