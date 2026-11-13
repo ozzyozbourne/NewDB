@@ -5,7 +5,7 @@
 //! magic "NEWDBMAN" | FORMAT_VERSION u32 | 0 u32
 //! count u32
 //! per partition:
-//!   name_len u16 | name | hour u64 | posts u64 | spans u64
+//!   name_len u16 | name | id u64 | hour u64 | posts u64 | spans u64
 //!   min_start_ns u64 | max_start_ns u64 | min_version u64 | max_version u64
 //!   layout_count u16 | per layout: name_len u16 | name | version u32
 //! crc32c u32 of everything before it
@@ -35,6 +35,8 @@ pub struct Manifest {
 pub struct PartitionEntry {
     /// Directory name.
     pub name: String,
+    /// Creation order, as in the partition's log header.
+    pub id: u64,
     /// Arrival hour, in hours since the Unix epoch.
     pub hour: u64,
     pub posts: u64,
@@ -57,6 +59,7 @@ pub fn encode(m: &Manifest) -> Vec<u8> {
     for p in &m.partitions {
         name(&mut out, &p.name);
         for v in [
+            p.id,
             p.hour,
             p.posts,
             p.spans,
@@ -94,7 +97,7 @@ pub fn decode(bytes: &[u8]) -> Result<Manifest> {
     for _ in 0..count {
         let n = c.u16()? as usize;
         let name = c.str(n)?.to_string();
-        let mut v = [0u64; 7];
+        let mut v = [0u64; 8];
         for x in &mut v {
             *x = c.u64()?;
         }
@@ -105,6 +108,7 @@ pub fn decode(bytes: &[u8]) -> Result<Manifest> {
             layouts.push((l, c.u32()?));
         }
         let [
+            id,
             hour,
             posts,
             spans,
@@ -115,6 +119,7 @@ pub fn decode(bytes: &[u8]) -> Result<Manifest> {
         ] = v;
         m.partitions.push(PartitionEntry {
             name,
+            id,
             hour,
             posts,
             spans,
@@ -161,6 +166,7 @@ mod tests {
             partitions: vec![
                 PartitionEntry {
                     name: "2026-11-13T01".into(),
+                    id: 3,
                     hour: 491_234,
                     posts: 10,
                     spans: 7,

@@ -1,7 +1,8 @@
 //! `log.seg`: the raw, append-only record of every post in a partition.
 //!
 //! ```text
-//! file:    magic "NEWDBLOG" | FORMAT_VERSION u32 | HEADER_FORMAT_VERSION u32 | hour u64
+//! file:    magic "NEWDBLOG" | FORMAT_VERSION u32 | HEADER_FORMAT_VERSION u32
+//!          partition id u64 | hour u64
 //! record:  len u32 | crc32c u32 | kind u8 | seq u64 | body
 //! ```
 //!
@@ -18,7 +19,7 @@ use newdb_types::{Result, SpanHeader};
 
 use crate::{Cursor, FILE_HEADER_LEN, MAGIC_LOG, check_file_header, corrupt, file_header};
 
-pub const HEADER_LEN: usize = FILE_HEADER_LEN + 8;
+pub const HEADER_LEN: usize = FILE_HEADER_LEN + 16;
 /// `len u32 | crc u32`.
 pub const RECORD_PREFIX_LEN: usize = 8;
 /// `kind u8 | seq u64`.
@@ -31,11 +32,13 @@ pub mod kind {
     pub const STRING: u8 = 2;
 }
 
-/// The file header of a partition's log; `hour` is hours since the Unix epoch.
-pub fn file_header_bytes(hour: u64) -> [u8; HEADER_LEN] {
+/// The file header of a partition's log. `id` orders partitions by creation; `hour` is the
+/// arrival hour, in hours since the Unix epoch.
+pub fn file_header_bytes(id: u64, hour: u64) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
     h[..FILE_HEADER_LEN].copy_from_slice(&file_header(MAGIC_LOG, HEADER_FORMAT_VERSION));
-    h[FILE_HEADER_LEN..].copy_from_slice(&hour.to_le_bytes());
+    h[FILE_HEADER_LEN..FILE_HEADER_LEN + 8].copy_from_slice(&id.to_le_bytes());
+    h[FILE_HEADER_LEN + 8..].copy_from_slice(&hour.to_le_bytes());
     h
 }
 
@@ -100,6 +103,7 @@ impl<'a> Record<'a> {
 pub struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
+    pub id: u64,
     pub hour: u64,
     torn: bool,
 }
@@ -115,10 +119,12 @@ impl<'a> Reader<'a> {
             )));
         }
         let mut c = Cursor::new(&bytes[FILE_HEADER_LEN..], "log");
+        let id = c.u64()?;
         let hour = c.u64()?;
         Ok(Reader {
             bytes,
             pos: HEADER_LEN,
+            id,
             hour,
             torn: false,
         })
@@ -187,7 +193,7 @@ mod tests {
             fields: newdb_types::header::field::NAME,
             ..SpanHeader::default()
         };
-        let mut log = file_header_bytes(491_234).to_vec();
+        let mut log = file_header_bytes(9, 491_234).to_vec();
         append_string(&mut log, 1, "agent");
         append_post(&mut log, &h);
         append_post(&mut log, &SpanHeader { version: 43, ..h });
@@ -198,7 +204,7 @@ mod tests {
     fn round_trips_records() {
         let (log, h) = sample();
         let mut r = Reader::new(&log).unwrap();
-        assert_eq!(r.hour, 491_234);
+        assert_eq!((r.id, r.hour), (9, 491_234));
         let recs: Vec<_> = r.by_ref().collect();
         assert_eq!(recs.len(), 3);
         assert_eq!(recs[0].string().unwrap(), (1, "agent"));
