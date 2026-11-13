@@ -8,11 +8,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use newdb_layouts::Cost;
-use newdb_types::header::field::{ERROR, INPUTS, OUTPUTS};
+use newdb_types::header::field::{END, ERROR, INPUTS, MODEL, NAME, OUTPUTS, PARENT, SESSION};
 use newdb_types::text::tokens;
 use newdb_types::{
-    Read, ReadStats, Result, Run, RunKey, RunQuery, SearchHit, SearchQuery, Span, SpanHeader,
-    TraceId, TraceQuery,
+    Read, ReadStats, Result, Run, RunKey, RunQuery, RunSummary, RunType, SearchHit, SearchQuery,
+    Span, SpanHeader, Status, TraceId, TraceQuery,
 };
 
 use crate::part::{
@@ -159,6 +159,7 @@ pub(crate) fn runs(views: &[View<'_>], q: &RunQuery) -> Result<Read<Vec<Run>>> {
     // Ascending by (key, project): the first entry is the oldest kept.
     let mut best: BTreeMap<(RunKey, String), Run> = BTreeMap::new();
     let mut cache: HashMap<TraceId, Vec<Merged>> = HashMap::new();
+    let mut multis: HashMap<TraceId, bool> = HashMap::new();
     let mut order: Vec<usize> = (0..views.len()).collect();
     order.sort_by_key(|&i| Reverse(views[i].stats().max_start()));
     let floor = |best: &BTreeMap<(RunKey, String), Run>| -> Option<RunKey> {
@@ -189,6 +190,20 @@ pub(crate) fn runs(views: &[View<'_>], q: &RunQuery) -> Result<Read<Vec<Run>>> {
             if pid.is_some_and(|id| s.project != id) {
                 return Ok(true);
             }
+            // A run whose trace has no posts in another partition is complete here: filter
+            // on its summary, and build the Run (strings) only for those that pass.
+            if !multi(views, pi, s.trace_id, &mut multis, &mut st)? {
+                if !may_match(q, s) {
+                    return Ok(true);
+                }
+                if let Some(run) = summary_run(v, s)?.filter(|r| q.matches(r)) {
+                    best.insert((run.key(), run.project.clone()), run);
+                    if best.len() > q.limit {
+                        best.pop_first();
+                    }
+                }
+                return Ok(true);
+            }
             let project = v
                 .strings()
                 .get(s.project)
@@ -214,6 +229,87 @@ pub(crate) fn runs(views: &[View<'_>], q: &RunQuery) -> Result<Read<Vec<Run>>> {
     }
     ph.mark("scan");
     Ok(done(best.into_values().rev().collect(), st, ph))
+}
+
+/// Whether trace `t` has posts in a partition other than `pi` (cached per query). The
+/// in-memory filters rule out most partitions; a filter hit is confirmed by a lookup.
+fn multi(
+    views: &[View<'_>],
+    pi: usize,
+    t: TraceId,
+    cache: &mut HashMap<TraceId, bool>,
+    st: &mut ReadStats,
+) -> Result<bool> {
+    if let Some(&m) = cache.get(&t) {
+        return Ok(m);
+    }
+    let mut m = false;
+    for (j, w) in views.iter().enumerate() {
+        if j != pi && w.may_contain(t) {
+            let (h, cost) = w.trace(t)?;
+            add_cost(st, cost);
+            if !h.is_empty() {
+                m = true;
+                break;
+            }
+        }
+    }
+    cache.insert(t, m);
+    Ok(m)
+}
+
+/// The numeric filters of `q` on a summary, without building the run. Only rejects runs
+/// `q.matches` would reject too.
+fn may_match(q: &RunQuery, s: &RunSummary) -> bool {
+    let has = |bit: u32| s.fields as u32 & bit != 0;
+    let latency = has(END).then(|| s.end_ns.saturating_sub(s.start_ns));
+    !has(PARENT)
+        && q.status.is_none_or(|x| x as u8 == s.status)
+        && q.run_type.is_none_or(|x| x as u8 == s.run_type)
+        && q.min_latency_ns
+            .is_none_or(|m| latency.is_some_and(|l| l >= m))
+        && q.min_total_tokens
+            .is_none_or(|m| s.prompt_tokens as u64 + s.completion_tokens as u64 >= m)
+        && q.min_cost_micro_usd.is_none_or(|m| s.cost_micro_usd >= m)
+}
+
+/// The run of a summary merged within one partition, as `Run::from_root` would build it
+/// from the merged span.
+fn summary_run(v: &View<'_>, s: &RunSummary) -> Result<Option<Run>> {
+    let has = |bit: u32| s.fields as u32 & bit != 0;
+    if has(PARENT) {
+        return Ok(None);
+    }
+    let strings = v.strings();
+    let get = |bit: u32, id: u32| -> Result<Option<String>> {
+        if !has(bit) {
+            return Ok(None);
+        }
+        strings
+            .get(id)
+            .map(|x| Some(x.to_string()))
+            .ok_or_else(|| corrupt("run summary string is not in the partition"))
+    };
+    let status = Status::from_u8(s.status).ok_or_else(|| corrupt("bad status"))?;
+    let run_type = RunType::from_u8(s.run_type).ok_or_else(|| corrupt("bad run type"))?;
+    Ok(Some(Run {
+        project: strings
+            .get(s.project)
+            .ok_or_else(|| corrupt("run summary project is not in the partition"))?
+            .to_string(),
+        trace_id: s.trace_id,
+        span_id: s.span_id,
+        name: get(NAME, s.name)?,
+        start_ns: s.start_ns,
+        end_ns: has(END).then_some(s.end_ns),
+        status,
+        run_type,
+        model: get(MODEL, s.model)?,
+        session: get(SESSION, s.session)?,
+        prompt_tokens: s.prompt_tokens,
+        completion_tokens: s.completion_tokens,
+        cost_micro_usd: s.cost_micro_usd,
+    }))
 }
 
 /// Candidates from the `fts` postings (a span is a candidate when each query token appears

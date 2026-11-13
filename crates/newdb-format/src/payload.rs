@@ -153,7 +153,7 @@ pub fn decode(entry: &[u8], r: PayloadRef) -> Result<Vec<u8>> {
     match e.codec {
         codec::RAW => Ok(data.to_vec()),
         _ => {
-            let out = zstd::bulk::decompress(data, r.raw_len as usize)
+            let out = decompress(data, r.raw_len as usize)
                 .map_err(|e| corrupt(format!("payload: zstd: {e}")))?;
             if out.len() != r.raw_len as usize {
                 return Err(corrupt("payload: decompressed length mismatch"));
@@ -161,6 +161,23 @@ pub fn decode(entry: &[u8], r: PayloadRef) -> Result<Vec<u8>> {
             Ok(out)
         }
     }
+}
+
+thread_local! {
+    /// One decompression context per thread: creating one per payload showed in profiles.
+    static DCTX: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn decompress(data: &[u8], capacity: usize) -> std::io::Result<Vec<u8>> {
+    DCTX.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let d = match slot.as_mut() {
+            Some(d) => d,
+            None => slot.insert(zstd::bulk::Decompressor::new()?),
+        };
+        d.decompress(data, capacity)
+    })
 }
 
 /// The byte range of `r`'s entry in the file, or an error if `r` cannot be a valid

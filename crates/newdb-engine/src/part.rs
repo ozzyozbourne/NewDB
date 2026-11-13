@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard};
 
 use newdb_format::manifest::PartitionEntry;
 use newdb_format::{log, payload, strings as strtbl};
@@ -126,6 +126,9 @@ pub(crate) struct Layouts {
     extra: Vec<(&'static LayoutDef, Mutex<Box<dyn LayoutBuilder>>)>,
 }
 
+/// Smaller batches apply faster on one thread than the threads cost to start.
+const PARALLEL_APPLY: usize = 256;
+
 const BUILT_IN: [&str; 4] = [
     trace_clustered::NAME,
     runs_by_time::NAME,
@@ -148,13 +151,40 @@ impl Layouts {
         }
     }
 
+    /// Applies a batch to every builder: `fts` and `trace_clustered` on their own threads
+    /// when the batch is large and the machine has more than one core.
     pub fn apply(&mut self, b: &Batch<'_>) {
-        self.tc.apply(b);
-        self.runs.apply(b);
-        self.filter.apply(b);
-        self.fts.apply(b);
-        for (_, x) in &mut self.extra {
-            x.get_mut().unwrap_or_else(|e| e.into_inner()).apply(b);
+        static CORES: OnceLock<usize> = OnceLock::new();
+        let cores =
+            *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        let Layouts {
+            tc,
+            runs,
+            filter,
+            fts,
+            extra,
+        } = self;
+        let mut rest = |runs: &mut runs_by_time::Builder, filter: &mut trace_filter::Builder| {
+            runs.apply(b);
+            filter.apply(b);
+            for (_, x) in extra.iter_mut() {
+                x.get_mut().unwrap_or_else(|e| e.into_inner()).apply(b);
+            }
+        };
+        if cores > 1 && b.headers.len() >= PARALLEL_APPLY {
+            std::thread::scope(|s| {
+                s.spawn(|| fts.apply(b));
+                if cores > 2 {
+                    s.spawn(|| tc.apply(b));
+                } else {
+                    tc.apply(b);
+                }
+                rest(runs, filter);
+            });
+        } else {
+            tc.apply(b);
+            fts.apply(b);
+            rest(runs, filter);
         }
     }
 
