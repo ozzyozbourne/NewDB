@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! newdb serve   --data <dir> [--addr 127.0.0.1:4318] [--no-fsync] [--memory]
+//!               [--mapping mapping.json --pricing pricing.json]
 //! newdb inspect --data <dir>
 //! newdb verify  --data <dir>
 //! newdb rebuild --data <dir> [--layout <name>]
@@ -11,7 +12,9 @@
 //! `--memory` runs against `newdb_testkit::Oracle`, so every command except the engine-only
 //! ones (inspect, verify, rebuild) works before the engine lands.
 //!
-//! `serve` prints `listening on http://<addr>` on stdout once it accepts connections, so
+//! `serve` normalizes OTLP with the mapping and pricing tables built into `newdb-otlp`, or
+//! with the two files given by `--mapping` and `--pricing` (the same format as
+//! `crates/newdb-otlp/data/`). It prints `listening on http://<addr>` on stdout once it accepts connections, so
 //! `--addr 127.0.0.1:0` can be used to get a free port. Exit codes: 0 success, 1 failure
 //! (including `verify` problems), 2 bad arguments.
 
@@ -22,6 +25,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use newdb_engine::{Config, Db, InspectReport};
+use newdb_otlp::Normalizer;
 use newdb_testkit::Oracle;
 use newdb_tools::{BenchConfig, BenchReport, CountingAlloc};
 use newdb_types::Store;
@@ -31,6 +35,7 @@ static ALLOC: CountingAlloc = CountingAlloc;
 
 const USAGE: &str = "usage:
   newdb serve   (--data <dir> | --memory) [--addr 127.0.0.1:4318] [--no-fsync]
+                [--mapping mapping.json --pricing pricing.json]
   newdb inspect --data <dir>
   newdb verify  --data <dir>
   newdb rebuild --data <dir> [--layout <name>]
@@ -71,7 +76,7 @@ fn run(args: &[String]) -> Result<ExitCode, Fail> {
     match cmd.as_str() {
         "serve" => serve(&Args::parse(
             rest,
-            &["data", "addr"],
+            &["data", "addr", "mapping", "pricing"],
             &["no-fsync", "memory"],
         )?),
         "inspect" => inspect(&Args::parse(rest, &["data"], &[])?),
@@ -193,11 +198,17 @@ fn serve(a: &Args) -> Result<ExitCode, Fail> {
         .unwrap_or("127.0.0.1:4318")
         .parse()
         .map_err(|_| Fail::Usage("--addr must be <ip>:<port>".into()))?;
+    let normalizer = match (a.get("mapping"), a.get("pricing")) {
+        (None, None) => Normalizer::builtin(),
+        (Some(m), Some(p)) => Normalizer::from_files(m.as_ref(), p.as_ref())
+            .map_err(|e| Fail::Run(format!("loading --mapping {m} --pricing {p}: {e}")))?,
+        _ => return Err(Fail::Usage("--mapping and --pricing go together".into())),
+    };
     let store = a.store()?;
     let config = newdb_server::ServerConfig {
         addr,
         max_body_bytes: 64 << 20,
-        normalizer: Arc::new(newdb_otlp::Normalizer::builtin()),
+        normalizer: Arc::new(normalizer),
     };
     let server = newdb_server::start(store, config)?;
     println!("listening on http://{}", server.addr());
