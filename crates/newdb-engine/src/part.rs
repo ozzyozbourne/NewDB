@@ -123,7 +123,7 @@ pub(crate) struct Layouts {
     pub filter: trace_filter::Builder,
     pub fts: fts::Builder,
     /// `LayoutBuilder` is only `Send`; the mutex makes `Layouts` shareable with readers.
-    extra: Vec<(&'static LayoutDef, Mutex<Box<dyn LayoutBuilder>>)>,
+    extra: Vec<Extra>,
 }
 
 /// Tests set this to run the multi-threaded paths on any machine (nextest runs each test
@@ -148,8 +148,30 @@ pub(crate) fn cores() -> usize {
 /// Smaller batches apply faster on one thread than the threads cost to start.
 pub(crate) const PARALLEL_APPLY: usize = 256;
 
-/// One part of applying a batch, see [`Layouts::jobs`].
-pub(crate) type ApplyJob<'s> = Box<dyn FnOnce() + Send + 's>;
+/// Builders of [`Layouts`] that apply a batch independently of the other groups.
+pub(crate) enum Group {
+    Fts(fts::Builder),
+    Tc(trace_clustered::Builder),
+    Rest(runs_by_time::Builder, trace_filter::Builder, Vec<Extra>),
+}
+
+type Extra = (&'static LayoutDef, Mutex<Box<dyn LayoutBuilder>>);
+
+impl Group {
+    pub fn apply(&mut self, b: &Batch<'_>) {
+        match self {
+            Group::Fts(x) => x.apply(b),
+            Group::Tc(x) => x.apply(b),
+            Group::Rest(runs, filter, extra) => {
+                runs.apply(b);
+                filter.apply(b);
+                for (_, x) in extra.iter_mut() {
+                    x.get_mut().unwrap_or_else(|e| e.into_inner()).apply(b);
+                }
+            }
+        }
+    }
+}
 
 const BUILT_IN: [&str; 4] = [
     trace_clustered::NAME,
@@ -180,45 +202,52 @@ impl Layouts {
     }
 
     pub fn apply_on(&mut self, b: &Batch<'_>, cores: usize) {
-        let [fts, tc, rest] = self.jobs(b);
+        let mut groups = self.take();
         if cores > 1 && b.headers.len() >= PARALLEL_APPLY {
+            let [fts, tc, rest] = &mut groups;
             std::thread::scope(|s| {
-                s.spawn(fts);
+                s.spawn(|| fts.apply(b));
                 if cores > 2 {
-                    s.spawn(tc);
+                    s.spawn(|| tc.apply(b));
                 } else {
-                    tc();
+                    tc.apply(b);
                 }
-                rest();
+                rest.apply(b);
             });
         } else {
-            tc();
-            fts();
-            rest();
+            groups.iter_mut().for_each(|g| g.apply(b));
         }
+        self.put(groups);
     }
 
-    /// A batch's work in independent parts that may run on different threads: `fts`,
-    /// `trace_clustered`, and the rest.
-    pub fn jobs<'s>(&'s mut self, b: &'s Batch<'_>) -> [ApplyJob<'s>; 3] {
-        let Layouts {
-            tc,
-            runs,
-            filter,
-            fts,
-            extra,
-        } = self;
+    /// Moves the builders out, in groups that apply independently (and so may apply on
+    /// other threads), leaving empty builders until [`Layouts::put`].
+    pub fn take(&mut self) -> [Group; 3] {
+        use std::mem::take;
         [
-            Box::new(|| fts.apply(b)),
-            Box::new(|| tc.apply(b)),
-            Box::new(move || {
-                runs.apply(b);
-                filter.apply(b);
-                for (_, x) in extra.iter_mut() {
-                    x.get_mut().unwrap_or_else(|e| e.into_inner()).apply(b);
-                }
-            }),
+            Group::Fts(take(&mut self.fts)),
+            Group::Tc(take(&mut self.tc)),
+            Group::Rest(
+                take(&mut self.runs),
+                take(&mut self.filter),
+                take(&mut self.extra),
+            ),
         ]
+    }
+
+    /// Puts back the groups [`Layouts::take`] moved out, in any order.
+    pub fn put(&mut self, groups: impl IntoIterator<Item = Group>) {
+        for g in groups {
+            match g {
+                Group::Fts(x) => self.fts = x,
+                Group::Tc(x) => self.tc = x,
+                Group::Rest(runs, filter, extra) => {
+                    self.runs = runs;
+                    self.filter = filter;
+                    self.extra = extra;
+                }
+            }
+        }
     }
 
     /// Every registered layout's files, in `LAYOUTS` order.

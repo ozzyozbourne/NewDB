@@ -17,7 +17,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
@@ -37,8 +36,8 @@ use crate::files::{
     remove_dir_if_exists, sync_dir, write_synced,
 };
 use crate::part::{
-    ApplyJob, Blob, Body, Layouts, Live, Mode, PARALLEL_APPLY, PAYLOAD_FIELDS, Part, Stats,
-    Strings, cores, corrupt, open_sealed, present, replay,
+    Blob, Body, Group, Layouts, Live, Mode, PARALLEL_APPLY, PAYLOAD_FIELDS, Part, Stats, Strings,
+    cores, corrupt, open_sealed, present, replay,
 };
 
 pub(crate) type Ack = Sender<Result<()>>;
@@ -403,18 +402,20 @@ impl Writer {
         for s in &enc.new_strings.list {
             a.strings.push(s.clone());
         }
-        let job = Job {
-            part: a.part.clone(),
-            seq: 0,
+        let posts = Posts {
             first_post: a.posts,
             headers,
             spans,
+        };
+        a.posts += posts.headers.len() as u32;
+        self.next_version += posts.headers.len() as u64;
+        Ok(Some(Job {
+            part: a.part.clone(),
+            seq: 0,
+            posts,
             strings: enc.new_strings.list,
             pay_len: a.pay_len,
-        };
-        a.posts += job.headers.len() as u32;
-        self.next_version += job.headers.len() as u64;
-        Ok(Some(job))
+        }))
     }
 
     /// Writes the active partition's layouts and string table, lists it in MANIFEST and
@@ -586,21 +587,36 @@ impl Visible {
 struct Job {
     part: Arc<Part>,
     seq: u64,
-    first_post: u32,
-    headers: Vec<SpanHeader>,
-    spans: Vec<Span>,
+    posts: Posts,
     /// Strings the batch added to the partition's table, in ID order.
     strings: Vec<String>,
     /// Committed length of the payload file after the batch.
     pay_len: u64,
 }
 
+/// The posts of a written batch, as the layouts receive them.
+struct Posts {
+    first_post: u32,
+    headers: Vec<SpanHeader>,
+    spans: Vec<Span>,
+}
+
+impl Posts {
+    fn batch(&self) -> Batch<'_> {
+        Batch {
+            first_post: self.first_post,
+            headers: &self.headers,
+            spans: &self.spans,
+        }
+    }
+}
+
 impl Job {
     /// Appends the next batch of the same partition.
     fn merge(&mut self, next: Job) {
         self.seq = next.seq;
-        self.headers.extend(next.headers);
-        self.spans.extend(next.spans);
+        self.posts.headers.extend(next.posts.headers);
+        self.posts.spans.extend(next.posts.spans);
         self.strings.extend(next.strings);
         self.pay_len = next.pay_len;
     }
@@ -685,7 +701,7 @@ fn apply_loop(inner: &Inner, rx: Receiver<Apply>) {
                 let _ = done.send(());
             }
             Apply::Batch(mut job) => {
-                while job.headers.len() < MERGE_POSTS {
+                while job.posts.headers.len() < MERGE_POSTS {
                     match rx.try_recv() {
                         Ok(Apply::Batch(j)) if Arc::ptr_eq(&j.part, &job.part) => job.merge(j),
                         Ok(other) => {
@@ -703,113 +719,91 @@ fn apply_loop(inner: &Inner, rx: Receiver<Apply>) {
     }
 }
 
-/// Applies a written batch to its partition's layouts and makes it visible.
+/// Applies a written batch to its partition's layouts. Readers wait on the write lock
+/// meanwhile, so they never see the layouts while their builders are out on the workers.
 fn apply(pool: &Pool, job: Job) {
     let Some(live) = job.part.live() else {
         return;
     };
     let mut g = live.write().unwrap_or_else(|e| e.into_inner());
-    let g = &mut *g;
     for s in job.strings {
         g.strings.push(s);
     }
     if let Blob::File { len, .. } = &mut g.blob {
         *len = job.pay_len;
     }
-    let b = Batch {
-        first_post: job.first_post,
-        headers: &job.headers,
-        spans: &job.spans,
-    };
-    let jobs = g.layouts.jobs(&b);
-    if b.headers.len() >= PARALLEL_APPLY {
-        pool.run(jobs);
+    let posts = Arc::new(job.posts);
+    if posts.headers.len() >= PARALLEL_APPLY {
+        let groups = pool.run(g.layouts.take(), &posts);
+        g.layouts.put(groups);
     } else {
-        jobs.into_iter().for_each(|j| j());
+        g.layouts.apply_on(&posts.batch(), 1);
     }
-    for h in &job.headers {
+    for h in &posts.headers {
         g.stats.add(h);
         g.keys.insert((h.project, h.trace_id, h.span_id));
     }
     g.stats.spans = g.keys.len() as u64;
 }
 
-/// Persistent threads that run the parts of a layout apply alongside the applier.
+/// Persistent threads that apply builder groups alongside the applier. A worker gets a
+/// group and the batch by value and sends the group back.
 struct Pool {
-    workers: Vec<Sender<Task>>,
+    workers: Vec<Worker>,
 }
 
-struct Task {
-    job: ApplyJob<'static>,
-    done: Sender<std::thread::Result<()>>,
+struct Worker {
+    tx: Sender<(Group, Arc<Posts>)>,
+    rx: Receiver<Group>,
 }
 
 impl Pool {
     fn new(n: usize) -> Pool {
         let workers = (0..n)
             .filter_map(|i| {
-                let (tx, rx) = channel::<Task>();
+                let (tx, work) = channel::<(Group, Arc<Posts>)>();
+                let (back, rx) = channel();
                 std::thread::Builder::new()
                     .name(format!("newdb-apply-{}", i + 1))
                     .spawn(move || {
-                        for t in rx {
-                            let _ = t.done.send(catch_unwind(AssertUnwindSafe(t.job)));
+                        for (mut g, posts) in work {
+                            g.apply(&posts.batch());
+                            if back.send(g).is_err() {
+                                return;
+                            }
                         }
                     })
                     .ok()
-                    .map(|_| tx)
+                    .map(|_| Worker { tx, rx })
             })
             .collect();
         Pool { workers }
     }
 
-    /// Runs every job, the first on this thread and the rest on the workers (or here when
-    /// there are too few), and returns once all have finished. Re-raises a job's panic.
-    fn run<const N: usize>(&self, jobs: [ApplyJob<'_>; N]) {
-        let (done_tx, done_rx) = channel();
-        let mut jobs = jobs.into_iter();
-        let mut here: Vec<ApplyJob<'_>> = jobs.next().into_iter().collect();
-        let mut sent = 0;
+    /// Applies `posts` to every group, the first on this thread and the others on the
+    /// workers (or here when there are too few), and returns the groups.
+    fn run(&self, groups: impl IntoIterator<Item = Group>, posts: &Arc<Posts>) -> Vec<Group> {
+        let mut groups = groups.into_iter();
+        let mut here: Vec<Group> = groups.next().into_iter().collect();
+        let mut away = Vec::new();
         let mut workers = self.workers.iter();
-        for job in jobs {
-            let Some(w) = workers.next() else {
-                here.push(job);
-                continue;
-            };
-            // SAFETY: only the lifetime changes. The job's borrows outlive this call, and
-            // this call returns only after every job a worker accepted has finished or been
-            // dropped: below it waits for one message per accepted job, and a worker sends
-            // that message after running the job (panics are caught) or drops the sender
-            // with the job if its thread ends.
-            let job: ApplyJob<'static> = unsafe { std::mem::transmute(job) };
-            match w.send(Task {
-                job,
-                done: done_tx.clone(),
-            }) {
-                Ok(()) => sent += 1,
-                Err(e) => here.push(e.0.job),
+        for g in groups {
+            match workers.next() {
+                Some(w) => match w.tx.send((g, posts.clone())) {
+                    Ok(()) => away.push(w),
+                    Err(e) => here.push(e.0.0),
+                },
+                None => here.push(g),
             }
         }
-        drop(done_tx);
-        let mut panicked = None;
-        for job in here {
-            if let Err(p) = catch_unwind(AssertUnwindSafe(job)) {
-                panicked.get_or_insert(p);
-            }
-        }
-        for _ in 0..sent {
-            match done_rx.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(p)) => {
-                    panicked.get_or_insert(p);
-                }
-                // Every sender is gone, so no worker holds a job any more.
-                Err(_) => break,
-            }
-        }
-        if let Some(p) = panicked {
-            resume_unwind(p);
-        }
+        let b = posts.batch();
+        here.iter_mut().for_each(|g| g.apply(&b));
+        // A worker that panicked dropped its group: the layouts cannot continue.
+        here.extend(
+            away.into_iter()
+                .map(|w| w.rx.recv().expect("layout worker panicked")),
+        );
+        here
     }
 }
 
