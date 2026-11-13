@@ -230,6 +230,55 @@ fn post(t: u8, s: u8) -> Span {
     }
 }
 
+/// Search keeps spread traces merged over sealed partitions between queries. A seal
+/// moves a trace's newest posts from the active partition into a sealed one, and the
+/// next search must still see them.
+#[test]
+fn search_sees_a_spread_trace_across_a_seal() {
+    let dir = TestDir::new("spread-seal");
+    let d = Driver::new(dir.path(), 0, 0, 0);
+    let oracle = Oracle::new();
+    let both = |spans: Vec<Span>| {
+        oracle.ingest(spans.clone()).unwrap();
+        d.ingest(spans).unwrap();
+    };
+    let q = |text: &str| SearchQuery {
+        text: text.into(),
+        limit: 10,
+        ..SearchQuery::default()
+    };
+    let agree = |text: &str| {
+        assert_eq!(
+            d.search(&q(text)).unwrap().value,
+            oracle.search(&q(text)).unwrap().value,
+            "{text}"
+        );
+    };
+    both(vec![Span {
+        start_ns: Some(100),
+        inputs: Some(b"\"refund\"".to_vec()),
+        ..post(1, 1)
+    }]);
+    d.with(|db| db.seal_active()).unwrap();
+    // The trace now spans the sealed partition and the active one.
+    both(vec![Span {
+        outputs: Some(b"\"policy\"".to_vec()),
+        ..post(1, 1)
+    }]);
+    agree("refund policy");
+    d.with(|db| db.seal_active()).unwrap();
+    agree("refund policy");
+    // A post in the new active partition moves the span's start.
+    both(vec![Span {
+        start_ns: Some(50),
+        ..post(1, 1)
+    }]);
+    agree("refund policy");
+    d.with(|db| db.seal_active()).unwrap();
+    agree("refund policy");
+    assert_eq!(d.search(&q("refund policy")).unwrap().value.len(), 1);
+}
+
 /// The cases from the brief, built by hand so each one is certain to happen.
 #[test]
 fn cross_partition_cases() {

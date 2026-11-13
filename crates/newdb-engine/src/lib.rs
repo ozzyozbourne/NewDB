@@ -16,6 +16,7 @@ mod pool;
 mod query;
 mod reframe;
 mod span_ref;
+mod spread;
 #[cfg(test)]
 mod tests;
 mod writer;
@@ -173,6 +174,8 @@ pub(crate) struct Inner {
     reads: Mutex<HashMap<&'static str, VecDeque<u64>>>,
     /// Sealed partitions whose payloads are still to move into payloads.sealed.
     pub reframe: reframe::Queue,
+    /// Search's merged spans of the traces in `multi`, over sealed partitions.
+    pub spread: spread::Cache,
     /// Held for the database's lifetime so only one process writes.
     _lock: Option<File>,
 }
@@ -333,6 +336,7 @@ impl Db {
             visible: Default::default(),
             reads: Mutex::default(),
             reframe: Default::default(),
+            spread: Default::default(),
             _lock: lock,
         });
         let sealed = inner.parts();
@@ -586,6 +590,8 @@ impl Store for Db {
     }
 
     fn search(&self, query: &SearchQuery) -> Result<Read<Vec<SearchHit>>> {
-        self.read("search", |v| query::search(v, &self.inner.multi(), query))
+        self.read("search", |v| {
+            query::search(v, &self.inner.multi(), &self.inner.spread, query)
+        })
     }
 }

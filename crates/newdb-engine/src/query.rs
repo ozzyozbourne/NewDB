@@ -20,6 +20,7 @@ use crate::part::{
     ALL_PAYLOADS, BlobRef, PAYLOAD_FIELDS, Payloads, View, corrupt, payload_ref, set_payload,
     summary_key, to_span,
 };
+use crate::spread::{self, Spread};
 
 /// One span merged across partitions, without payloads until [`load_payloads`].
 pub(crate) struct Merged {
@@ -185,27 +186,6 @@ const FRAME_CACHE: usize = 16 << 20;
 
 fn payloads<'a>(views: &'a [View<'_>]) -> Payloads<'a> {
     Payloads::new(views.iter().map(|v| v.blob()).collect(), FRAME_CACHE)
-}
-
-/// Fills the payload fields in `mask`: each comes from the last piece that set it.
-fn load_payloads(
-    pay: &mut Payloads<'_>,
-    m: &mut Merged,
-    mask: u32,
-    st: &mut ReadStats,
-) -> Result<()> {
-    for bit in PAYLOAD_FIELDS {
-        if mask & bit == 0 {
-            continue;
-        }
-        let found = m.pieces().rev().find(|(_, h)| h.has(bit)).copied();
-        if let Some((pi, h)) = found {
-            let bytes = pay.read(pi, payload_ref(&h, bit))?;
-            st.payload_bytes_decompressed += bytes.len() as u64;
-            set_payload(&mut m.span, bit, bytes)?;
-        }
-    }
-    Ok(())
 }
 
 /// Below this many raw payload bytes, a trace load decodes on the calling thread only.
@@ -532,12 +512,14 @@ fn summary_run(v: &View<'_>, s: &RunSummary) -> Result<Option<Run>> {
 /// from each partition's `intersect_newest` stream. Spans of traces spread over several
 /// partitions (the engine's `multi` set) can have their tokens split across partitions
 /// and their start set elsewhere, so they are merged across partitions first and form one
-/// more stream, sorted by merged key. A heap merges the streams newest first; partitions
+/// more stream, sorted by merged key ([`spread`], which keeps the merge over sealed
+/// partitions between queries). A heap merges the streams newest first; partitions
 /// open in order of their newest start, only once they could hold the next hit. Each
 /// candidate is confirmed against its merged `inputs` and `outputs`.
 pub(crate) fn search(
     views: &[View<'_>],
     multi: &HashSet<TraceId>,
+    cache: &spread::Cache,
     q: &SearchQuery,
 ) -> Result<Read<Vec<SearchHit>>> {
     let mut ph = Phases::new(q.timings);
@@ -549,23 +531,17 @@ pub(crate) fn search(
     let toks: Vec<&[u8]> = want.iter().map(Vec::as_slice).collect();
     let mut pay = payloads(views);
 
-    // Spans of spread traces, merged, newest first (popped from the back).
-    let mut spread: Vec<(RunKey, Merged)> = Vec::new();
-    let mut traces: Vec<TraceId> = multi.iter().copied().collect();
-    traces.sort_unstable();
-    for t in traces {
-        for m in load_trace(views, t, q.project.as_deref(), false, &mut st)? {
-            if m.pieces().any(|(_, h)| h.has(INPUTS) || h.has(OUTPUTS)) {
-                let key = RunKey {
-                    start_ns: m.span.start_ns.unwrap_or(0),
-                    trace_id: t,
-                    span_id: m.span.span_id,
-                };
-                spread.push((key, m));
-            }
-        }
-    }
-    spread.sort_unstable_by(|a, b| (a.0, &a.1.span.project).cmp(&(b.0, &b.1.span.project)));
+    // Spans of spread traces, merged, newest first.
+    let sealed = views.iter().take_while(|v| v.sealed).count();
+    let state = cache.get(&views[..sealed], multi, &mut st)?;
+    let mut spread = Spread::new(
+        &state,
+        &views[sealed..],
+        multi,
+        q.project.as_deref(),
+        &mut st,
+    )?;
+    let view_of: HashMap<u64, usize> = views.iter().enumerate().map(|(i, v)| (v.id, i)).collect();
     ph.mark("spread");
 
     let mut order: Vec<usize> = (0..views.len())
@@ -580,8 +556,8 @@ pub(crate) fn search(
     let mut streams: Vec<(usize, Box<dyn Iterator<Item = fts::Hit> + '_>)> = Vec::new();
     // (key, stream index); usize::MAX is the spread stream.
     let mut heap: BinaryHeap<(RunKey, usize)> = BinaryHeap::new();
-    if let Some((k, _)) = spread.last() {
-        heap.push((*k, usize::MAX));
+    if let Some(k) = spread.peek() {
+        heap.push((k, usize::MAX));
     }
     let key = |(start_ns, trace_id, span_id): fts::Hit| RunKey {
         start_ns,
@@ -611,15 +587,27 @@ pub(crate) fn search(
         };
         st.records_visited += 1;
         if src == usize::MAX {
-            let Some((_, mut m)) = spread.pop() else {
+            let Some(s) = spread.pop() else {
                 break;
             };
-            if let Some((k2, _)) = spread.last() {
-                heap.push((*k2, usize::MAX));
+            if let Some(k2) = spread.peek() {
+                heap.push((k2, usize::MAX));
             }
-            load_payloads(&mut pay, &mut m, INPUTS | OUTPUTS, &mut st)?;
-            if matches(&want, m.span.inputs.as_deref(), m.span.outputs.as_deref()) {
-                hits.push(hit(&m.span.project, k));
+            // Each payload field comes from the last piece that set it.
+            let mut read = |bit: u32| -> Result<Option<Vec<u8>>> {
+                let Some((id, h)) = s.pieces.iter().rev().find(|(_, h)| h.has(bit)) else {
+                    return Ok(None);
+                };
+                let pi = *view_of
+                    .get(id)
+                    .ok_or_else(|| corrupt("spread span from a partition not in the snapshot"))?;
+                let bytes = pay.read(pi, payload_ref(h, bit))?;
+                st.payload_bytes_decompressed += bytes.len() as u64;
+                Ok(Some(bytes))
+            };
+            let (i, o) = (read(INPUTS)?, read(OUTPUTS)?);
+            if matches(&want, i.as_deref(), o.as_deref()) {
+                hits.push(hit(&s.span.project, k));
             }
         } else {
             let (pi, it) = &mut streams[src];

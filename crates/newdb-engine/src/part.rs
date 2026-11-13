@@ -637,6 +637,8 @@ impl Part {
             Body::Live(l) => Src::Live(l.read().unwrap_or_else(|e| e.into_inner())),
         };
         View {
+            id: self.id,
+            sealed: self.sealed,
             src,
             tc: OnceCell::new(),
             runs: OnceCell::new(),
@@ -660,6 +662,9 @@ enum Src<'a> {
 /// A read-only view of one partition for the duration of one query. Readers of sealed
 /// layout files are opened (and validated) at most once per query.
 pub(crate) struct View<'a> {
+    /// The partition's ID and whether it is listed in MANIFEST (and so immutable).
+    pub id: u64,
+    pub sealed: bool,
     src: Src<'a>,
     tc: OnceCell<trace_clustered::Reader<'a>>,
     runs: OnceCell<runs_by_time::Reader<'a>>,
