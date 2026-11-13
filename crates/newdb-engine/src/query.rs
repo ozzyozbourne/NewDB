@@ -11,12 +11,13 @@ use newdb_layouts::{Cost, fts};
 use newdb_types::header::field::{END, ERROR, INPUTS, MODEL, NAME, OUTPUTS, PARENT, SESSION};
 use newdb_types::text::tokens;
 use newdb_types::{
-    Read, ReadStats, Result, Run, RunKey, RunQuery, RunSummary, RunType, SearchHit, SearchQuery,
-    Span, SpanHeader, Status, TraceId, TraceQuery,
+    Error, Read, ReadStats, Result, Run, RunKey, RunQuery, RunSummary, RunType, SearchHit,
+    SearchQuery, Span, SpanHeader, Status, TraceId, TraceQuery,
 };
 
 use crate::part::{
-    ALL_PAYLOADS, PAYLOAD_FIELDS, View, corrupt, payload_ref, set_payload, summary_key, to_span,
+    ALL_PAYLOADS, BlobRef, PAYLOAD_FIELDS, View, cores, corrupt, payload_ref, set_payload,
+    summary_key, to_span,
 };
 
 /// One span merged across partitions, without payloads until [`load_payloads`].
@@ -90,19 +91,27 @@ pub(crate) fn load_trace(
 }
 
 /// Fills the payload fields in `mask`: each comes from the last piece that set it.
-fn load_payloads(views: &[View<'_>], m: &mut Merged, mask: u32, st: &mut ReadStats) -> Result<()> {
+fn load_payloads(
+    blobs: &[BlobRef<'_>],
+    m: &mut Merged,
+    mask: u32,
+    st: &mut ReadStats,
+) -> Result<()> {
     for bit in PAYLOAD_FIELDS {
         if mask & bit == 0 {
             continue;
         }
         if let Some((pi, h)) = m.pieces.iter().rev().find(|(_, h)| h.has(bit)) {
-            let bytes = views[*pi].blob().read(payload_ref(h, bit))?;
+            let bytes = blobs[*pi].read(payload_ref(h, bit))?;
             st.payload_bytes_decompressed += bytes.len() as u64;
             set_payload(&mut m.span, bit, bytes)?;
         }
     }
     Ok(())
 }
+
+/// Below this many payload bytes per thread, a trace load decompresses on one thread.
+const PARALLEL_PAYLOAD_BYTES: usize = 1 << 20;
 
 struct Phases {
     on: bool,
@@ -140,8 +149,51 @@ pub(crate) fn trace(views: &[View<'_>], q: &TraceQuery) -> Result<Read<Vec<Span>
     let mut merged = load_trace(views, q.trace_id, Some(&q.project), &mut st)?;
     ph.mark("headers");
     let mask = if q.payloads { ALL_PAYLOADS } else { ERROR };
-    for m in &mut merged {
-        load_payloads(views, m, mask, &mut st)?;
+    let blobs: Vec<BlobRef<'_>> = views.iter().map(|v| v.blob()).collect();
+    // Decompression dominates large traces: split it across threads when there is enough.
+    let raw: usize = merged
+        .iter()
+        .flat_map(|m| &m.pieces)
+        .map(|(_, h)| {
+            PAYLOAD_FIELDS
+                .iter()
+                .filter(|&&b| mask & b != 0 && h.has(b))
+                .map(|&b| payload_ref(h, b).raw_len as usize)
+                .sum::<usize>()
+        })
+        .sum();
+    let threads = cores().min(8).min(raw / PARALLEL_PAYLOAD_BYTES + 1);
+    if threads <= 1 {
+        for m in &mut merged {
+            load_payloads(&blobs, m, mask, &mut st)?;
+        }
+    } else {
+        let chunk = merged.len().div_ceil(threads);
+        let parts: Vec<Result<ReadStats>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = merged
+                .chunks_mut(chunk)
+                .map(|c| {
+                    let blobs = &blobs;
+                    sc.spawn(move || {
+                        let mut st = ReadStats::default();
+                        for m in c {
+                            load_payloads(blobs, m, mask, &mut st)?;
+                        }
+                        Ok(st)
+                    })
+                })
+                .collect();
+            hs.into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        Err(Error::Io(std::io::Error::other("payload thread panicked")))
+                    })
+                })
+                .collect()
+        });
+        for p in parts {
+            st.add(&p?);
+        }
     }
     let mut out: Vec<Span> = merged.into_iter().map(|m| m.span).collect();
     out.sort_by_key(|s| (s.start_ns.unwrap_or(0), s.span_id));
@@ -310,6 +362,7 @@ pub(crate) fn search(
         return Ok(done(Vec::new(), st, ph));
     }
     let toks: Vec<&[u8]> = want.iter().map(Vec::as_slice).collect();
+    let blobs: Vec<BlobRef<'_>> = views.iter().map(|v| v.blob()).collect();
 
     // Spans of spread traces, merged, newest first (popped from the back).
     let mut spread: Vec<(RunKey, Merged)> = Vec::new();
@@ -382,7 +435,7 @@ pub(crate) fn search(
             if let Some((k2, _)) = spread.last() {
                 heap.push((*k2, usize::MAX));
             }
-            load_payloads(views, &mut m, INPUTS | OUTPUTS, &mut st)?;
+            load_payloads(&blobs, &mut m, INPUTS | OUTPUTS, &mut st)?;
             if matches(&want, m.span.inputs.as_deref(), m.span.outputs.as_deref()) {
                 hits.push(hit(&m.span.project, k));
             }

@@ -126,6 +126,25 @@ pub(crate) struct Layouts {
     extra: Vec<(&'static LayoutDef, Mutex<Box<dyn LayoutBuilder>>)>,
 }
 
+/// Tests set this to run the multi-threaded paths on any machine (nextest runs each test
+/// in its own process).
+#[cfg(test)]
+pub(crate) static FORCE_CORES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// CPUs this process may use.
+pub(crate) fn cores() -> usize {
+    #[cfg(test)]
+    {
+        let forced = FORCE_CORES.load(std::sync::atomic::Ordering::Relaxed);
+        if forced > 0 {
+            return forced;
+        }
+    }
+    static CORES: OnceLock<usize> = OnceLock::new();
+    *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
 /// Smaller batches apply faster on one thread than the threads cost to start.
 const PARALLEL_APPLY: usize = 256;
 
@@ -154,9 +173,10 @@ impl Layouts {
     /// Applies a batch to every builder: `fts` and `trace_clustered` on their own threads
     /// when the batch is large and the machine has more than one core.
     pub fn apply(&mut self, b: &Batch<'_>) {
-        static CORES: OnceLock<usize> = OnceLock::new();
-        let cores =
-            *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        self.apply_on(b, cores());
+    }
+
+    pub fn apply_on(&mut self, b: &Batch<'_>, cores: usize) {
         let Layouts {
             tc,
             runs,

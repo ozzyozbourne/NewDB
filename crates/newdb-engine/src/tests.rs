@@ -603,6 +603,20 @@ fn default_workload_with_large_payloads_matches_the_oracle() {
     check(&posts, 64, &Driver::new(dir.path(), 4, 0, 9));
 }
 
+/// The default workload again, as if on 4 cores: layouts are applied in parallel and
+/// large traces decompressed in parallel.
+#[test]
+fn multi_core_paths_match_the_oracle() {
+    crate::part::FORCE_CORES.store(4, Ordering::Relaxed);
+    let dir = TestDir::new("cores");
+    let posts = generate(&GenConfig {
+        traces: 30,
+        large_payload_rate: 0.05,
+        ..GenConfig::default()
+    });
+    check(&posts, 400, &Driver::new(dir.path(), 2, 0, 0));
+}
+
 /// Writers on several threads and readers alongside them. Each writer owns its traces, so
 /// the merged spans equal the oracle's except for `version`, which depends on interleaving.
 #[test]
@@ -695,4 +709,30 @@ fn an_idle_writer_commits_at_once() {
         "{:?}",
         t.elapsed()
     );
+}
+
+/// Parallel layout apply gives the same bytes as one thread (it only runs on machines
+/// with more than one core, so force it here).
+#[test]
+fn parallel_apply_matches_one_thread() {
+    use crate::part::Layouts;
+    let posts = generate(&GenConfig::small(31));
+    let dir = TestDir::new("apply");
+    let d = Driver::new(dir.path(), 0, 0, 0);
+    d.ingest(posts.clone()).unwrap();
+    let part = d.with(|db| db.inner.parts()[0].clone());
+    let mut builders = [Layouts::new(), Layouts::new(), Layouts::new()];
+    crate::part::replay(&part.dir, crate::part::Mode::Strict, &mut |b| {
+        for (i, l) in builders.iter_mut().enumerate() {
+            l.apply_on(b, i + 1);
+        }
+    })
+    .unwrap();
+    let sealed: Vec<_> = builders.iter().map(|l| l.seal().unwrap()).collect();
+    for s in &sealed[1..] {
+        assert_eq!(
+            s.iter().map(|(_, f)| f).collect::<Vec<_>>(),
+            sealed[0].iter().map(|(_, f)| f).collect::<Vec<_>>()
+        );
+    }
 }
