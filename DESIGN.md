@@ -120,7 +120,8 @@ data/
 
 ### 6.3 Payload store
 
-- Prompts, completions, tool arguments, attributes and events go into `payloads.blob`: zstd-compressed with a per-partition dictionary, addressed by an xxh3-128 hash.
+- Prompts, completions, tool arguments, attributes and events go into `payloads.blob`, each compressed on its own with zstd level 1 (no dictionary) and addressed by an xxh3-128 hash.
+- After a seal, a background step re-frames a partition's payloads into `payloads.sealed`: 64 KiB zstd level-3 frames in trace order, so a trace's payloads decompress together. Readers use `payloads.blob` until the new file is durable and swapped in.
 - Within a partition, identical payloads are stored once. A hash hit is confirmed by comparing bytes, so a collision cannot return the wrong payload.
 - Reads return the original JSON bytes. The HTTP API splices them into the response without parsing them. In Forge, tree building with payload parsing plus response serialization was 26 of 75 ms.
 

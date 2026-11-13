@@ -53,10 +53,9 @@ debug = false
 [profile.release]
 lto = "thin"
 
+# The bench numbers are the targets, so they come from the same build users run.
 [profile.bench]
 inherits = "release"
-lto = "off"
-codegen-units = 16
 
 # Used only by scripts/release.
 [profile.dist]
