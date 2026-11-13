@@ -93,6 +93,9 @@ pub struct BenchReport {
     /// them (the oracle). The CLI fills these in.
     pub partitions: Option<u64>,
     pub bytes_on_disk: Option<u64>,
+    /// Peak resident set size of the bench process at the end of the run (`VmHWM` from
+    /// `/proc/self/status`; `None` where that file does not exist, such as macOS).
+    pub peak_rss_bytes: Option<u64>,
     /// Spans the `trace_largest_*` reads return.
     pub trace_spans: u64,
     /// Posts per second spent in `ingest` calls (generation and seals not counted).
@@ -287,7 +290,20 @@ pub fn run_bench_with(
                 .push((name.to_string(), percentile(&allocs, 50)));
         }
     }
+    report.peak_rss_bytes = peak_rss_bytes();
     Ok(report)
+}
+
+/// `VmHWM` of this process in bytes, on Linux.
+fn peak_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim();
+    kb.parse::<u64>().ok().map(|kb| kb * 1024)
 }
 
 /// Traces per generated chunk.
@@ -404,11 +420,12 @@ impl BenchReport {
         let _ = write!(
             s,
             "{{\n  \"posts\": {},\n  \"partitions\": {},\n  \"bytes_on_disk\": {},\n  \
-             \"trace_spans\": {},\n  \"ingest_posts_per_sec\": {:?},\n  \"seals\": {},\n  \
+             \"peak_rss_bytes\": {},\n  \"trace_spans\": {},\n  \"ingest_posts_per_sec\": {:?},\n  \"seals\": {},\n  \
              \"seal\": {},\n  \"reads\": {{",
             self.posts,
             opt(self.partitions),
             opt(self.bytes_on_disk),
+            opt(self.peak_rss_bytes),
             self.trace_spans,
             rate,
             self.seals,
@@ -462,6 +479,7 @@ impl BenchReport {
                 "posts" => r.posts = v.u64(k)?,
                 "partitions" => r.partitions = v.opt_u64(k)?,
                 "bytes_on_disk" => r.bytes_on_disk = v.opt_u64(k)?,
+                "peak_rss_bytes" => r.peak_rss_bytes = v.opt_u64(k)?,
                 "trace_spans" => r.trace_spans = v.u64(k)?,
                 "ingest_posts_per_sec" => r.ingest_posts_per_sec = v.f64(k)?,
                 "seals" => r.seals = v.u64(k)?,
@@ -500,6 +518,7 @@ impl BenchReport {
             count("posts", Some(self.posts), Some(other.posts)),
             count("partitions", self.partitions, other.partitions),
             count("bytes on disk", self.bytes_on_disk, other.bytes_on_disk),
+            count("peak RSS bytes", self.peak_rss_bytes, other.peak_rss_bytes),
             count(
                 "trace spans",
                 Some(self.trace_spans),
@@ -914,6 +933,11 @@ mod tests {
         distinct.dedup();
         assert_eq!(oracle.len(), distinct.len());
         assert!(report.ingest_posts_per_sec > 0.0);
+        // Within a factor of two of what the kernel reports for this process right now.
+        if let Some(rss) = peak_rss_bytes() {
+            let r = report.peak_rss_bytes.unwrap();
+            assert!(r > 1 << 20 && r <= rss && r * 2 > rss, "{r} vs {rss}");
+        }
         let names: Vec<&str> = report.reads.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
@@ -1067,6 +1091,7 @@ mod tests {
             posts: 18_446_744_073_709_551_615,
             partitions: Some(3),
             bytes_on_disk: None,
+            peak_rss_bytes: Some(1 << 30),
             trace_spans: 2000,
             ingest_posts_per_sec: 123_456.789_012_345,
             seals: 12,
@@ -1134,6 +1159,7 @@ mod tests {
         let mut b = sample();
         b.ingest_posts_per_sec = a.ingest_posts_per_sec * 2.0;
         b.partitions = Some(6);
+        b.peak_rss_bytes = Some(3 << 29);
         b.reads[1].1.p50 = Duration::from_micros(60);
         b.reads.push(("new_read".into(), Latency::default()));
         let table = a.compare(&b);
@@ -1149,6 +1175,10 @@ mod tests {
         assert_eq!(line("ingest"), "ingest posts/s 123457 246914 +100.0%");
         assert_eq!(line("partitions"), "partitions 3 6 +100.0%");
         assert_eq!(line("bytes on disk"), "bytes on disk - - -");
+        assert_eq!(
+            line("peak RSS"),
+            "peak RSS bytes 1073741824 1610612736 +50.0%"
+        );
         assert_eq!(line("trace spans"), "trace spans 2000 2000 +0.0%");
         assert_eq!(line("seal p99"), "seal p99 90.00 ms 90.00 ms +0.0%");
         assert_eq!(
