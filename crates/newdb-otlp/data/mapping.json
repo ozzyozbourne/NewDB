@@ -1,0 +1,142 @@
+{
+  "_doc": "Attribute-name mapping from OTLP span attributes to newdb Span fields. Embedded in newdb-otlp; override with Normalizer::from_files. Every list is in priority order: OTel GenAI semantic conventions first, then OpenInference, then OpenLLMetry (Traceloop) and LangSmith names. See newdb-otlp/src/mapping.rs for what each key means.",
+  "project": ["newdb.project", "forge.project", "service.name"],
+  "default_project": "default",
+  "run_type": [
+    {
+      "attribute": "gen_ai.operation.name",
+      "values": {
+        "chat": "chat_model",
+        "generate_content": "chat_model",
+        "text_completion": "llm",
+        "completion": "llm",
+        "embeddings": "embedding",
+        "embedding": "embedding",
+        "execute_tool": "tool",
+        "invoke_agent": "agent",
+        "create_agent": "agent",
+        "retrieve": "retriever",
+        "retrieval": "retriever"
+      }
+    },
+    {
+      "attribute": "openinference.span.kind",
+      "ignore_case": true,
+      "values": {
+        "llm": "llm",
+        "chain": "chain",
+        "guardrail": "chain",
+        "evaluator": "chain",
+        "prompt": "chain",
+        "tool": "tool",
+        "agent": "agent",
+        "retriever": "retriever",
+        "reranker": "retriever",
+        "embedding": "embedding"
+      }
+    },
+    {
+      "attribute": "llm.request.type",
+      "values": {
+        "chat": "chat_model",
+        "completion": "llm",
+        "embedding": "embedding",
+        "rerank": "retriever"
+      }
+    },
+    {
+      "attribute": "traceloop.span.kind",
+      "values": {
+        "workflow": "chain",
+        "task": "chain",
+        "agent": "agent",
+        "tool": "tool"
+      }
+    },
+    {
+      "attribute": "langsmith.span.kind",
+      "ignore_case": true,
+      "values": {
+        "llm": "llm",
+        "chat_model": "chat_model",
+        "tool": "tool",
+        "chain": "chain",
+        "agent": "agent",
+        "retriever": "retriever",
+        "embedding": "embedding",
+        "other": "other"
+      },
+      "otherwise": "chain"
+    }
+  ],
+  "run_type_when_present": {
+    "attributes": ["gen_ai.request.model", "gen_ai.response.model", "llm.model_name"],
+    "run_type": "llm"
+  },
+  "model": [
+    "gen_ai.request.model",
+    "gen_ai.response.model",
+    "llm.model_name",
+    "llm.request.model",
+    "llm.response.model"
+  ],
+  "provider": ["gen_ai.provider.name", "gen_ai.system", "llm.provider", "llm.system"],
+  "prompt_tokens": [
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.prompt_tokens",
+    "llm.token_count.prompt",
+    "llm.usage.prompt_tokens"
+  ],
+  "completion_tokens": [
+    "gen_ai.usage.output_tokens",
+    "gen_ai.usage.completion_tokens",
+    "llm.token_count.completion",
+    "llm.usage.completion_tokens"
+  ],
+  "session": [
+    "session.id",
+    "gen_ai.conversation.id",
+    "langsmith.metadata.session_id",
+    "langsmith.metadata.thread_id",
+    "langsmith.metadata.conversation_id",
+    "traceloop.association.properties.session_id",
+    "traceloop.association.properties.thread_id",
+    "thread_id"
+  ],
+  "drop": ["gen_ai.response.model", "input.mime_type", "output.mime_type"],
+  "inputs": {
+    "fields": {
+      "gen_ai.input.messages": "messages",
+      "gen_ai.system_instructions": "system_instructions",
+      "gen_ai.tool.call.arguments": "arguments"
+    },
+    "indexed_messages": [
+      { "prefix": "llm.input_messages.", "inner": "message." },
+      { "prefix": "gen_ai.prompt.", "inner": "" }
+    ],
+    "message_events": {
+      "gen_ai.system.message": "system",
+      "gen_ai.user.message": "user",
+      "gen_ai.assistant.message": "assistant",
+      "gen_ai.tool.message": "tool"
+    },
+    "value": ["input.value", "traceloop.entity.input", "langsmith.inputs"],
+    "value_key": "input"
+  },
+  "outputs": {
+    "fields": {
+      "gen_ai.output.messages": "messages",
+      "gen_ai.tool.call.result": "result"
+    },
+    "indexed_messages": [
+      { "prefix": "llm.output_messages.", "inner": "message." },
+      { "prefix": "gen_ai.completion.", "inner": "" }
+    ],
+    "message_events": {
+      "gen_ai.choice": null
+    },
+    "value": ["output.value", "traceloop.entity.output", "langsmith.outputs"],
+    "value_key": "output"
+  },
+  "event_attributes_skipped": ["gen_ai.system"]
+}
