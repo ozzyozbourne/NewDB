@@ -267,8 +267,33 @@ fn cross_partition_cases() {
         name: Some("no start".into()),
         ..post(4, 1)
     }]);
+    // Search tokens only in an earlier partition while a later one moves the start, and
+    // tokens split between an open and a close post that both carry the start.
+    both(vec![
+        Span {
+            start_ns: Some(5),
+            inputs: Some(b"\"refund shipping\"".to_vec()),
+            ..post(5, 1)
+        },
+        Span {
+            start_ns: Some(7),
+            inputs: Some(b"\"refund\"".to_vec()),
+            ..post(6, 1)
+        },
+    ]);
+    both(vec![
+        Span {
+            start_ns: Some(10_000),
+            ..post(5, 1)
+        },
+        Span {
+            start_ns: Some(7),
+            outputs: Some(b"\"shipping\"".to_vec()),
+            ..post(6, 1)
+        },
+    ]);
     let mut posts = Vec::new();
-    for t in 1..=4 {
+    for t in 1..=6 {
         posts.push(post(t, 1));
     }
     queries_agree(&oracle, &d, &posts);
@@ -276,18 +301,26 @@ fn cross_partition_cases() {
         limit: 10,
         ..RunQuery::default()
     });
-    assert_eq!(runs.unwrap().value.len(), 4);
-    for text in ["refund", "shipping", "done", "shipping done"] {
-        let q = SearchQuery {
-            text: text.into(),
-            limit: 10,
-            ..Default::default()
-        };
-        assert_eq!(
-            oracle.search(&q).unwrap().value,
-            d.search(&q).unwrap().value,
-            "{text}"
-        );
+    assert_eq!(runs.unwrap().value.len(), 6);
+    for text in [
+        "refund",
+        "shipping",
+        "done",
+        "shipping done",
+        "refund shipping",
+    ] {
+        for limit in [1, 2, 10] {
+            let q = SearchQuery {
+                text: text.into(),
+                limit,
+                ..Default::default()
+            };
+            assert_eq!(
+                oracle.search(&q).unwrap().value,
+                d.search(&q).unwrap().value,
+                "{text} limit {limit}"
+            );
+        }
     }
     d.reopen(false);
     queries_agree(&oracle, &d, &posts);
@@ -570,6 +603,20 @@ fn default_workload_with_large_payloads_matches_the_oracle() {
     check(&posts, 64, &Driver::new(dir.path(), 4, 0, 9));
 }
 
+/// The default workload again, as if on 4 cores: layouts are applied in parallel and
+/// large traces decompressed in parallel.
+#[test]
+fn multi_core_paths_match_the_oracle() {
+    crate::part::FORCE_CORES.store(4, Ordering::Relaxed);
+    let dir = TestDir::new("cores");
+    let posts = generate(&GenConfig {
+        traces: 30,
+        large_payload_rate: 0.05,
+        ..GenConfig::default()
+    });
+    check(&posts, 400, &Driver::new(dir.path(), 2, 0, 0));
+}
+
 /// Writers on several threads and readers alongside them. Each writer owns its traces, so
 /// the merged spans equal the oracle's except for `version`, which depends on interleaving.
 #[test]
@@ -662,4 +709,30 @@ fn an_idle_writer_commits_at_once() {
         "{:?}",
         t.elapsed()
     );
+}
+
+/// Parallel layout apply gives the same bytes as one thread (it only runs on machines
+/// with more than one core, so force it here).
+#[test]
+fn parallel_apply_matches_one_thread() {
+    use crate::part::Layouts;
+    let posts = generate(&GenConfig::small(31));
+    let dir = TestDir::new("apply");
+    let d = Driver::new(dir.path(), 0, 0, 0);
+    d.ingest(posts.clone()).unwrap();
+    let part = d.with(|db| db.inner.parts()[0].clone());
+    let mut builders = [Layouts::new(), Layouts::new(), Layouts::new()];
+    crate::part::replay(&part.dir, crate::part::Mode::Strict, &mut |b| {
+        for (i, l) in builders.iter_mut().enumerate() {
+            l.apply_on(b, i + 1);
+        }
+    })
+    .unwrap();
+    let sealed: Vec<_> = builders.iter().map(|l| l.seal().unwrap()).collect();
+    for s in &sealed[1..] {
+        assert_eq!(
+            s.iter().map(|(_, f)| f).collect::<Vec<_>>(),
+            sealed[0].iter().map(|(_, f)| f).collect::<Vec<_>>()
+        );
+    }
 }

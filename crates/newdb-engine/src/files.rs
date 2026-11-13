@@ -11,6 +11,7 @@ pub(crate) const HOUR_NS: u64 = 3_600_000_000_000;
 pub(crate) const LOG: &str = "log.seg";
 pub(crate) const PAYLOADS: &str = "payloads.blob";
 pub(crate) const STRINGS: &str = "strings.tbl";
+pub(crate) const OVERLAP: &str = "overlap.bin";
 pub(crate) const LAYOUTS_DIR: &str = "layouts";
 pub(crate) const TRASH: &str = "trash";
 pub(crate) const LOCK: &str = "LOCK";

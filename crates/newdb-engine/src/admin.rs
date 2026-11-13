@@ -5,12 +5,12 @@ use std::fs;
 use std::path::Path;
 
 use newdb_format::manifest::{self, PartitionEntry};
-use newdb_format::{log, payload, strings as strtbl};
+use newdb_format::{log, overlap, payload, strings as strtbl};
 use newdb_layouts::{LAYOUTS, LayoutFiles};
 use newdb_types::{Result, SpanId, TraceId};
 
-use crate::files::{self, LAYOUTS_DIR, LOG, PAYLOADS, STRINGS, TRASH, layout_dir_name};
-use crate::part::{Mode, replay};
+use crate::files::{self, LAYOUTS_DIR, LOG, OVERLAP, PAYLOADS, STRINGS, TRASH, layout_dir_name};
+use crate::part::{Mode, log_traces, present, replay};
 use crate::{Inner, InspectReport, PartitionInfo, VerifyReport};
 
 pub(crate) fn verify(inner: &Inner) -> Result<VerifyReport> {
@@ -45,6 +45,15 @@ pub(crate) fn verify(inner: &Inner) -> Result<VerifyReport> {
         }
         rep.partitions_checked += 1;
         check_partition(&dir, e, &mut rep);
+        let earlier: Vec<_> = parts
+            .iter()
+            .filter(|p| p.sealed && p.id < e.id)
+            .cloned()
+            .collect();
+        if let Err(m) = check_overlap(&dir, &earlier) {
+            rep.problems
+                .push(format!("partition {}: overlap.bin: {m}", e.name));
+        }
     }
     let unsealed: HashSet<&str> = parts
         .iter()
@@ -65,6 +74,23 @@ pub(crate) fn verify(inner: &Inner) -> Result<VerifyReport> {
         }
     }
     Ok(rep)
+}
+
+/// `overlap.bin` lists every trace this partition shares with an earlier partition (it may
+/// list more, for earlier partitions that retention deleted).
+fn check_overlap(
+    dir: &Path,
+    earlier: &[std::sync::Arc<crate::part::Part>],
+) -> std::result::Result<(), String> {
+    let stored = overlap::decode(&fs::read(dir.join(OVERLAP)).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let stored: HashSet<TraceId> = stored.into_iter().collect();
+    let traces = log_traces(dir).map_err(|e| e.to_string())?;
+    let shared = present(earlier, &traces).map_err(|e| e.to_string())?;
+    match shared.iter().filter(|t| !stored.contains(t)).count() {
+        0 => Ok(()),
+        n => Err(format!("{n} shared traces are not listed")),
+    }
 }
 
 fn check_partition(dir: &Path, e: &PartitionEntry, rep: &mut VerifyReport) {

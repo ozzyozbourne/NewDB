@@ -28,11 +28,11 @@ use std::time::{Duration, Instant};
 use newdb_format::{log, manifest};
 use newdb_layouts::LAYOUTS;
 use newdb_types::{
-    Error, Read, Result, Run, RunQuery, SearchHit, SearchQuery, Span, Store, TraceQuery,
+    Error, Read, Result, Run, RunQuery, SearchHit, SearchQuery, Span, Store, TraceId, TraceQuery,
 };
 
 use files::{LAYOUTS_DIR, LOCK, TRASH, dir_bytes, file_len, layout_dir_name, remove_dir_if_exists};
-use part::{Body, Part, View, log_id, open_sealed, open_unsealed};
+use part::{Body, Fixed, Part, View, log_id, log_traces, open_sealed, open_unsealed, present};
 use writer::{Ack, Msg, Writer};
 
 /// Time source. Partitions are hours of `now_ns()` at commit time.
@@ -158,6 +158,9 @@ pub(crate) struct Inner {
     pub config: Config,
     /// Every partition, in creation order (which is also version order).
     parts: RwLock<Vec<Arc<Part>>>,
+    /// Traces with posts in more than one partition (a superset after retention): reads
+    /// merge their spans across partitions, every other span is complete in one.
+    pub multi: RwLock<HashSet<TraceId>>,
     /// Recent read durations per operation, for `inspect`.
     reads: Mutex<HashMap<&'static str, VecDeque<u64>>>,
     /// Held for the database's lifetime so only one process writes.
@@ -181,6 +184,18 @@ impl Inner {
             if slot.id == p.id {
                 *slot = p.clone();
             }
+        }
+    }
+
+    /// Taken after the query's partition views, so it covers every post they show.
+    pub fn multi(&self) -> std::sync::RwLockReadGuard<'_, HashSet<TraceId>> {
+        self.multi.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn add_multi(&self, traces: &[TraceId]) {
+        if !traces.is_empty() {
+            let mut m = self.multi.write().unwrap_or_else(|e| e.into_inner());
+            m.extend(traces.iter().copied());
         }
     }
 
@@ -289,11 +304,23 @@ impl Db {
             path,
             config,
             parts: RwLock::new(parts),
+            multi: RwLock::default(),
             reads: Mutex::default(),
             _lock: lock,
         });
+        let sealed = inner.parts();
+        for (i, p) in sealed.iter().enumerate() {
+            match &p.body {
+                Body::Fixed(Fixed {
+                    overlap: Some(o), ..
+                }) => inner.add_multi(o),
+                // Sealed before overlap.bin existed: compare with the earlier partitions.
+                _ => inner.add_multi(&present(&sealed[..i], &log_traces(&p.dir)?)?),
+            }
+        }
         if ro {
             for (_, dir) in unsealed {
+                inner.add_multi(&present(&inner.parts(), &log_traces(&dir)?)?);
                 let (fixed, id, hour) = open_unsealed(&dir)?;
                 let name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
                 inner.parts_mut().push(Arc::new(Part {
@@ -484,10 +511,10 @@ impl Store for Db {
     }
 
     fn runs(&self, query: &RunQuery) -> Result<Read<Vec<Run>>> {
-        self.read("runs", |v| query::runs(v, query))
+        self.read("runs", |v| query::runs(v, &self.inner.multi(), query))
     }
 
     fn search(&self, query: &SearchQuery) -> Result<Read<Vec<SearchHit>>> {
-        self.read("search", |v| query::search(v, query))
+        self.read("search", |v| query::search(v, &self.inner.multi(), query))
     }
 }

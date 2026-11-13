@@ -9,6 +9,7 @@
 //! - [`payload`]: `payloads.blob`: zstd frames addressed by xxh3-128, deduplicated within a
 //!   partition with a byte comparison on hash hits. Reads return the original bytes.
 //! - [`strings`]: `strings.tbl`: partition-local string table; ID 0 is "no string".
+//! - [`overlap`]: `overlap.bin`: traces of a sealed partition that earlier partitions share.
 //! - [`manifest`]: `MANIFEST`: format version, partitions with min/max span start, layout
 //!   versions per partition. Replaced atomically (write temp, fsync, rename, fsync dir).
 //!
@@ -16,6 +17,7 @@
 
 pub mod log;
 pub mod manifest;
+pub mod overlap;
 pub mod payload;
 pub mod strings;
 
@@ -28,6 +30,7 @@ pub const MAGIC_LOG: [u8; 8] = *b"NEWDBLOG";
 pub const MAGIC_PAYLOADS: [u8; 8] = *b"NEWDBPAY";
 pub const MAGIC_STRINGS: [u8; 8] = *b"NEWDBSTR";
 pub const MAGIC_MANIFEST: [u8; 8] = *b"NEWDBMAN";
+pub const MAGIC_OVERLAP: [u8; 8] = *b"NEWDBOVL";
 
 /// Every engine file starts with `magic [8] | FORMAT_VERSION u32 | extra u32`.
 pub const FILE_HEADER_LEN: usize = 16;

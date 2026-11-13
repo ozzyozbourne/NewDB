@@ -7,10 +7,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 
 use newdb_format::manifest::PartitionEntry;
-use newdb_format::{log, payload, strings as strtbl};
+use newdb_format::{log, overlap, payload, strings as strtbl};
 use newdb_layouts::{
     Batch, Cost, FileSet, LAYOUTS, LayoutBuilder, LayoutDef, LayoutFiles, fts, runs_by_time,
     trace_clustered, trace_filter,
@@ -21,7 +21,7 @@ use newdb_types::{
     TraceId,
 };
 
-use crate::files::{self, Bytes, LAYOUTS_DIR, LOG, PAYLOADS, STRINGS, layout_dir_name};
+use crate::files::{self, Bytes, LAYOUTS_DIR, LOG, OVERLAP, PAYLOADS, STRINGS, layout_dir_name};
 
 pub(crate) fn corrupt(msg: impl Into<String>) -> Error {
     Error::Corrupt(msg.into())
@@ -126,6 +126,25 @@ pub(crate) struct Layouts {
     extra: Vec<(&'static LayoutDef, Mutex<Box<dyn LayoutBuilder>>)>,
 }
 
+/// Tests set this to run the multi-threaded paths on any machine (nextest runs each test
+/// in its own process).
+#[cfg(test)]
+pub(crate) static FORCE_CORES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// CPUs this process may use.
+pub(crate) fn cores() -> usize {
+    #[cfg(test)]
+    {
+        let forced = FORCE_CORES.load(std::sync::atomic::Ordering::Relaxed);
+        if forced > 0 {
+            return forced;
+        }
+    }
+    static CORES: OnceLock<usize> = OnceLock::new();
+    *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
 /// Smaller batches apply faster on one thread than the threads cost to start.
 const PARALLEL_APPLY: usize = 256;
 
@@ -154,9 +173,10 @@ impl Layouts {
     /// Applies a batch to every builder: `fts` and `trace_clustered` on their own threads
     /// when the batch is large and the machine has more than one core.
     pub fn apply(&mut self, b: &Batch<'_>) {
-        static CORES: OnceLock<usize> = OnceLock::new();
-        let cores =
-            *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        self.apply_on(b, cores());
+    }
+
+    pub fn apply_on(&mut self, b: &Batch<'_>, cores: usize) {
         let Layouts {
             tc,
             runs,
@@ -363,6 +383,8 @@ pub(crate) struct Fixed {
     pub layouts: FixedLayouts,
     /// `(layout, version)` directories on disk, from MANIFEST.
     pub versions: Vec<(String, u32)>,
+    /// Traces shared with earlier partitions (`overlap.bin`); `None` when not on disk.
+    pub overlap: Option<Vec<TraceId>>,
 }
 
 /// The active partition, appended to by the writer.
@@ -372,6 +394,9 @@ pub(crate) struct Live {
     pub stats: Stats,
     pub layouts: Layouts,
     pub keys: HashSet<Key>,
+    pub traces: HashSet<TraceId>,
+    /// Traces of this partition that sealed partitions have too, for `overlap.bin`.
+    pub overlap: Vec<TraceId>,
 }
 
 // One per partition, so the size difference between the variants does not matter.
@@ -528,13 +553,19 @@ impl<'a> View<'a> {
         Ok((h.to_vec(), c))
     }
 
-    pub fn postings(&self, token: &[u8]) -> Result<(Vec<(TraceId, SpanId)>, Cost)> {
+    /// Spans of this partition mentioning every token, newest first by their start here.
+    pub fn intersect_newest(
+        &self,
+        tokens: &[&[u8]],
+    ) -> Result<(Box<dyn Iterator<Item = fts::Hit> + '_>, Cost)> {
         if let Some(m) = self.memory() {
-            return Ok(m.fts.postings(token));
+            let (it, c) = m.fts.intersect_newest(tokens);
+            return Ok((Box::new(it), c));
         }
-        Ok(self
+        let (it, c) = self
             .reader(&self.fts, fts::NAME, fts::Reader::open)?
-            .postings(token))
+            .intersect_newest(tokens);
+        Ok((Box::new(it), c))
     }
 
     /// Calls `f` with run candidates newest first, starting after those with a key at or
@@ -743,6 +774,11 @@ pub(crate) fn open_sealed(dir: &Path, e: &PartitionEntry) -> Result<Fixed> {
         stats: Stats::from_entry(e),
         layouts,
         versions: e.layouts.clone(),
+        overlap: match fs::read(dir.join(OVERLAP)) {
+            Ok(b) => Some(overlap::decode(&b)?),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
+        },
     })
 }
 
@@ -756,6 +792,7 @@ pub(crate) fn open_unsealed(dir: &Path) -> Result<(Fixed, u64, u64)> {
         stats: rep.stats,
         layouts: FixedLayouts::Memory(Box::new(l)),
         versions: Vec::new(),
+        overlap: None,
     };
     Ok((fixed, rep.id, rep.hour))
 }
@@ -765,4 +802,34 @@ pub(crate) fn log_id(dir: &Path) -> Result<(u64, u64)> {
     let bytes = files::map(&dir.join(LOG))?;
     let r = log::Reader::new(&bytes)?;
     Ok((r.id, r.hour))
+}
+
+/// Which of `traces` have posts in any of `parts`. The filters rule out most partitions;
+/// a filter hit is confirmed by a lookup. `parts` must not include the writer's active
+/// partition while the writer calls this.
+pub(crate) fn present(parts: &[Arc<Part>], traces: &[TraceId]) -> Result<Vec<TraceId>> {
+    let tables: Vec<_> = parts.iter().map(|p| p.tables()).collect();
+    let views: Vec<_> = parts.iter().zip(&tables).map(|(p, t)| p.view(t)).collect();
+    let mut out = Vec::new();
+    for &t in traces {
+        for v in &views {
+            if v.may_contain(t) && !v.trace(t)?.0.is_empty() {
+                out.push(t);
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Distinct trace IDs of a partition's log, sorted.
+pub(crate) fn log_traces(dir: &Path) -> Result<Vec<TraceId>> {
+    let bytes = files::map(&dir.join(LOG))?;
+    let mut out: Vec<TraceId> = log::Reader::new(&bytes)?
+        .filter(|r| r.kind == log::kind::SPAN_POST)
+        .map(|r| r.post().map(|h| h.trace_id))
+        .collect::<Result<_>>()?;
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
 }
