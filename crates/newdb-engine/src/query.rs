@@ -108,11 +108,19 @@ pub(crate) fn load_trace(
             }
             Some(_) => {}
         }
+        let mut headers = headers;
+        if let Some(id) = pid {
+            headers.retain(|h| h.project == id);
+        }
+        // Only once the pool is awake for a large payload read: waking it just to build
+        // spans costs more than it saves.
+        let pooled = wake && woken;
+        let mut built = build_spans(&headers, v, pooled)?.map(Vec::into_iter);
         for h in headers {
-            if pid.is_some_and(|id| h.project != id) {
-                continue;
-            }
-            let s = to_span(&h, v.strings(), v.blob(), 0, &mut 0)?;
+            let s = match built.as_mut().and_then(|b| b.next()) {
+                Some(s) => s,
+                None => to_span(&h, v.strings(), v.blob(), 0, &mut 0)?,
+            };
             let has_start = s.start_ns.is_some();
             let project = v
                 .strings()
@@ -144,6 +152,32 @@ pub(crate) fn load_trace(
         }
     }
     Ok(out)
+}
+
+/// From this many headers on, a partition's spans are built on the read pool.
+const PARALLEL_SPANS: usize = 512;
+
+/// `headers` of partition `v` as spans, without payloads, in order, when `pooled` and
+/// there are enough to build them on the read pool; `None` to build them one by one in
+/// place.
+fn build_spans(headers: &[SpanHeader], v: &View<'_>, pooled: bool) -> Result<Option<Vec<Span>>> {
+    let (strings, blob) = (v.strings(), v.blob());
+    let build = |hs: &[SpanHeader]| -> Result<Vec<Span>> {
+        hs.iter()
+            .map(|h| to_span(h, strings, blob, 0, &mut 0))
+            .collect()
+    };
+    let threads = crate::pool::workers() + 1;
+    if !pooled || headers.len() < PARALLEL_SPANS || threads == 1 {
+        return Ok(None);
+    }
+    let size = headers.len().div_ceil(threads);
+    let chunks: Vec<&[SpanHeader]> = headers.chunks(size).collect();
+    let mut out = Vec::with_capacity(headers.len());
+    for r in crate::pool::each(chunks.len(), &|k| build(chunks[k])) {
+        out.extend(r.unwrap_or_else(|| Err(corrupt("span task panicked")))?);
+    }
+    Ok(Some(out))
 }
 
 /// Decompressed sealed frames one query keeps for its single payload reads.
