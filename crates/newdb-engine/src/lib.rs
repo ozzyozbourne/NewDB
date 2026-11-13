@@ -161,6 +161,8 @@ pub(crate) struct Inner {
     /// Traces with posts in more than one partition (a superset after retention): reads
     /// merge their spans across partitions, every other span is complete in one.
     pub multi: RwLock<HashSet<TraceId>>,
+    /// Acknowledged batches whose layouts the applier has not caught up with yet.
+    pub visible: writer::Visible,
     /// Recent read durations per operation, for `inspect`.
     reads: Mutex<HashMap<&'static str, VecDeque<u64>>>,
     /// Held for the database's lifetime so only one process writes.
@@ -305,6 +307,7 @@ impl Db {
             config,
             parts: RwLock::new(parts),
             multi: RwLock::default(),
+            visible: Default::default(),
             reads: Mutex::default(),
             _lock: lock,
         });
@@ -366,6 +369,7 @@ impl Db {
     /// Runs a query over a view of every partition.
     fn read<T>(&self, op: &'static str, f: impl FnOnce(&[View<'_>]) -> Result<T>) -> Result<T> {
         let t0 = Instant::now();
+        self.inner.visible.wait();
         let parts = self.inner.parts();
         let tables: Vec<_> = parts.iter().map(|p| p.tables()).collect();
         let views: Vec<View<'_>> = parts.iter().zip(&tables).map(|(p, t)| p.view(t)).collect();
@@ -386,6 +390,7 @@ impl Db {
     }
 
     pub fn partitions(&self) -> Result<Vec<PartitionInfo>> {
+        self.inner.visible.wait();
         Ok(self.inner.parts().iter().map(|p| info(p)).collect())
     }
 
@@ -503,7 +508,8 @@ impl Store for Db {
             return Ok(());
         }
         validate(&spans)?;
-        self.call(|ack| Msg::Ingest(spans, ack))
+        let pre = writer::prepare(&spans)?;
+        self.call(|ack| Msg::Ingest(spans, pre, ack))
     }
 
     fn trace(&self, query: &TraceQuery) -> Result<Read<Vec<Span>>> {

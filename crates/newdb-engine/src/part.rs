@@ -125,7 +125,7 @@ pub(crate) struct Layouts {
     pub filter: trace_filter::Builder,
     pub fts: fts::Builder,
     /// `LayoutBuilder` is only `Send`; the mutex makes `Layouts` shareable with readers.
-    extra: Vec<(&'static LayoutDef, Mutex<Box<dyn LayoutBuilder>>)>,
+    extra: Vec<Extra>,
 }
 
 /// Tests set this to run the multi-threaded paths on any machine (nextest runs each test
@@ -148,7 +148,32 @@ pub(crate) fn cores() -> usize {
 }
 
 /// Smaller batches apply faster on one thread than the threads cost to start.
-const PARALLEL_APPLY: usize = 256;
+pub(crate) const PARALLEL_APPLY: usize = 256;
+
+/// Builders of [`Layouts`] that apply a batch independently of the other groups.
+pub(crate) enum Group {
+    Fts(fts::Builder),
+    Tc(trace_clustered::Builder),
+    Rest(runs_by_time::Builder, trace_filter::Builder, Vec<Extra>),
+}
+
+type Extra = (&'static LayoutDef, Mutex<Box<dyn LayoutBuilder>>);
+
+impl Group {
+    pub fn apply(&mut self, b: &Batch<'_>) {
+        match self {
+            Group::Fts(x) => x.apply(b),
+            Group::Tc(x) => x.apply(b),
+            Group::Rest(runs, filter, extra) => {
+                runs.apply(b);
+                filter.apply(b);
+                for (_, x) in extra.iter_mut() {
+                    x.get_mut().unwrap_or_else(|e| e.into_inner()).apply(b);
+                }
+            }
+        }
+    }
+}
 
 const BUILT_IN: [&str; 4] = [
     trace_clustered::NAME,
@@ -179,21 +204,9 @@ impl Layouts {
     }
 
     pub fn apply_on(&mut self, b: &Batch<'_>, cores: usize) {
-        let Layouts {
-            tc,
-            runs,
-            filter,
-            fts,
-            extra,
-        } = self;
-        let mut rest = |runs: &mut runs_by_time::Builder, filter: &mut trace_filter::Builder| {
-            runs.apply(b);
-            filter.apply(b);
-            for (_, x) in extra.iter_mut() {
-                x.get_mut().unwrap_or_else(|e| e.into_inner()).apply(b);
-            }
-        };
+        let mut groups = self.take();
         if cores > 1 && b.headers.len() >= PARALLEL_APPLY {
+            let [fts, tc, rest] = &mut groups;
             std::thread::scope(|s| {
                 s.spawn(|| fts.apply(b));
                 if cores > 2 {
@@ -201,12 +214,41 @@ impl Layouts {
                 } else {
                     tc.apply(b);
                 }
-                rest(runs, filter);
+                rest.apply(b);
             });
         } else {
-            tc.apply(b);
-            fts.apply(b);
-            rest(runs, filter);
+            groups.iter_mut().for_each(|g| g.apply(b));
+        }
+        self.put(groups);
+    }
+
+    /// Moves the builders out, in groups that apply independently (and so may apply on
+    /// other threads), leaving empty builders until [`Layouts::put`].
+    pub fn take(&mut self) -> [Group; 3] {
+        use std::mem::take;
+        [
+            Group::Fts(take(&mut self.fts)),
+            Group::Tc(take(&mut self.tc)),
+            Group::Rest(
+                take(&mut self.runs),
+                take(&mut self.filter),
+                take(&mut self.extra),
+            ),
+        ]
+    }
+
+    /// Puts back the groups [`Layouts::take`] moved out, in any order.
+    pub fn put(&mut self, groups: impl IntoIterator<Item = Group>) {
+        for g in groups {
+            match g {
+                Group::Fts(x) => self.fts = x,
+                Group::Tc(x) => self.tc = x,
+                Group::Rest(runs, filter, extra) => {
+                    self.runs = runs;
+                    self.filter = filter;
+                    self.extra = extra;
+                }
+            }
         }
     }
 
@@ -427,9 +469,6 @@ pub(crate) struct Live {
     pub stats: Stats,
     pub layouts: Layouts,
     pub keys: HashSet<Key>,
-    pub traces: HashSet<TraceId>,
-    /// Traces of this partition that sealed partitions have too, for `overlap.bin`.
-    pub overlap: Vec<TraceId>,
 }
 
 // One per partition, so the size difference between the variants does not matter.
