@@ -147,6 +147,14 @@ pub(crate) fn cores() -> usize {
     *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
+/// Shards of every fts builder this process makes: each core but the writer's and the
+/// applier's, at most 8. Fixed per process, so the tokens `writer::prepare` routes on the
+/// ingesting threads always fit the builder they reach.
+pub(crate) fn fts_shards() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| cores().saturating_sub(2).clamp(1, 8))
+}
+
 /// Smaller batches apply faster on one thread than the threads cost to start.
 pub(crate) const PARALLEL_APPLY: usize = 256;
 
@@ -188,7 +196,7 @@ impl Layouts {
             tc: Default::default(),
             runs: Default::default(),
             filter: Default::default(),
-            fts: Default::default(),
+            fts: fts::Builder::with_shards(fts_shards()),
             extra: LAYOUTS
                 .iter()
                 .filter(|d| !BUILT_IN.contains(&d.name))
