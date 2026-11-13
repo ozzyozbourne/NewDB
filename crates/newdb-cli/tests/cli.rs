@@ -62,6 +62,8 @@ fn bad_arguments_exit_2_with_usage() {
         &["bench", "--memory", "--data", "/tmp/x"],
         &["bench", "--compare", "only-one.json"],
         &["serve", "--memory", "--addr", "localhost"],
+        &["serve", "--memory", "--mapping", "m.json"],
+        &["serve", "--memory", "--pricing", "p.json"],
         &["inspect"],
         &["verify", "--data"],
         &["rebuild", "--data", "d", "--bogus"],
@@ -82,4 +84,44 @@ fn compare_of_a_missing_or_corrupt_report_fails_cleanly() {
     ]);
     assert_eq!(o.status.code(), Some(1));
     assert!(stderr(&o).contains("/nonexistent/a.json"));
+}
+
+#[test]
+fn serve_rejects_bad_mapping_or_pricing_files_before_opening_the_store() {
+    let dir = std::env::temp_dir().join(format!("newdb-cli-serve-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../newdb-otlp/data");
+    let good = |f: &str| data.join(f).to_str().unwrap().to_string();
+    let bad = dir.join("bad.json");
+    std::fs::write(&bad, "{not json").unwrap();
+    let bad = bad.to_str().unwrap();
+    let store = dir.join("store");
+    let store = store.to_str().unwrap();
+
+    for (mapping, pricing, want) in [
+        (bad.to_string(), good("pricing.json"), "mapping file"),
+        (good("mapping.json"), bad.to_string(), "pricing file"),
+        (
+            good("mapping.json"),
+            "/nonexistent/p.json".into(),
+            "/nonexistent/p.json",
+        ),
+    ] {
+        let o = newdb(&[
+            "serve",
+            "--data",
+            store,
+            "--mapping",
+            &mapping,
+            "--pricing",
+            &pricing,
+        ]);
+        assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+        assert!(stderr(&o).contains(want), "{want}: {}", stderr(&o));
+    }
+    assert!(
+        !std::path::Path::new(store).exists(),
+        "the store was not opened"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }
