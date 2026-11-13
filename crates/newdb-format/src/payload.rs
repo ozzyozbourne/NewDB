@@ -169,23 +169,6 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-thread_local! {
-    static CCTX: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Compresses `raw` at [`ZSTD_LEVEL`] with this thread's context.
-pub(crate) fn compress(raw: &[u8]) -> std::io::Result<Vec<u8>> {
-    CCTX.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let c = match slot.as_mut() {
-            Some(c) => c,
-            None => slot.insert(zstd::bulk::Compressor::new(ZSTD_LEVEL)?),
-        };
-        c.compress(raw)
-    })
-}
-
 /// Decompresses `data`, a frame of exactly `dst.len()` raw bytes, into `dst`.
 pub(crate) fn decompress_into(data: &[u8], dst: &mut [u8]) -> std::io::Result<()> {
     DCTX.with(|cell| {
