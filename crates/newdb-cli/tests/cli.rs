@@ -125,3 +125,88 @@ fn serve_rejects_bad_mapping_or_pricing_files_before_opening_the_store() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn bench_on_a_real_db_seals_and_inspect_verify_rebuild_check_it() {
+    let dir = std::env::temp_dir().join(format!("newdb-cli-engine-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let data = dir.join("db");
+    let data = data.to_str().unwrap();
+    let ok = |args: &[&str]| {
+        let o = newdb(args);
+        assert!(o.status.success(), "{args:?}: {}", stderr(&o));
+        String::from_utf8(o.stdout).unwrap()
+    };
+
+    let report = ok(&[
+        "bench",
+        "--data",
+        data,
+        "--no-fsync",
+        "--traces",
+        "8",
+        "--iterations",
+        "2",
+    ]);
+    let report = BenchReport::from_json(&report).unwrap();
+    assert_eq!(report.reads.len(), 6);
+
+    let inspect = ok(&["inspect", "--data", data]);
+    let row = inspect.lines().nth(1).unwrap();
+    assert!(
+        row.split_whitespace().nth(1) == Some("yes"),
+        "sealed:\n{inspect}"
+    );
+    assert!(
+        row.split_whitespace().nth(2) == Some(&report.posts.to_string()[..]),
+        "{inspect}"
+    );
+    for layout in [
+        "trace_clustered.v1",
+        "runs_by_time.v1",
+        "trace_filter.v1",
+        "fts.v1",
+    ] {
+        assert!(row.contains(layout), "{layout}:\n{inspect}");
+    }
+    assert!(inspect.contains("spans per trace: p50"), "{inspect}");
+
+    assert_eq!(
+        ok(&["verify", "--data", data]),
+        "verified 1 partitions, 4 layouts: 0 problems\n"
+    );
+    assert_eq!(
+        ok(&["rebuild", "--data", data, "--layout", "fts"]),
+        "rebuilt fts\n"
+    );
+    assert_eq!(ok(&["rebuild", "--data", data]), "rebuilt every layout\n");
+    assert_eq!(
+        ok(&["verify", "--data", data]),
+        "verified 1 partitions, 4 layouts: 0 problems\n"
+    );
+
+    let o = newdb(&["rebuild", "--data", data, "--layout", "no_such_layout"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+
+    // Damage one byte of a sealed layout file: verify reports it and exits 1.
+    let layouts = std::fs::read_dir(data)
+        .unwrap()
+        .map(|e| e.unwrap().path().join("layouts/runs_by_time.v1"))
+        .find(|p| p.is_dir())
+        .unwrap();
+    let file = std::fs::read_dir(&layouts)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut bytes = std::fs::read(&file).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&file, bytes).unwrap();
+    let o = newdb(&["verify", "--data", data]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(o.status.code(), Some(1), "{out}{}", stderr(&o));
+    assert!(out.contains("problem: "), "{out}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

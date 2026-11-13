@@ -6,11 +6,19 @@
 //! newdb inspect --data <dir>
 //! newdb verify  --data <dir>
 //! newdb rebuild --data <dir> [--layout <name>]
-//! newdb bench   [--data <dir> | --memory] [--no-fsync] [--traces N] [--batch N] [--iterations N] [--out report.json]
+//! newdb bench   [--data <dir> | --memory] [--no-fsync] [--no-seal] [--traces N] [--batch N] [--iterations N] [--out report.json]
 //! newdb bench   --compare a.json b.json
 //! ```
 //! `--memory` runs against `newdb_testkit::Oracle`, so every command except the engine-only
 //! ones (inspect, verify, rebuild) works before the engine lands.
+//!
+//! `bench --data` seals the active partition after the ingest, so the timed reads walk
+//! sealed, memory-mapped layout files as most reads do; `--no-seal` times the in-memory
+//! active partition instead. Use a fresh directory: the workload is ingested on top of
+//! whatever is there.
+//!
+//! `inspect` and `verify` open the directory read-only, so they work next to a running
+//! `serve`. `rebuild` needs the writer.
 //!
 //! `serve` normalizes OTLP with the mapping and pricing tables built into `newdb-otlp`, or
 //! with the two files given by `--mapping` and `--pricing` (the same format as
@@ -39,7 +47,7 @@ const USAGE: &str = "usage:
   newdb inspect --data <dir>
   newdb verify  --data <dir>
   newdb rebuild --data <dir> [--layout <name>]
-  newdb bench   (--data <dir> | --memory) [--no-fsync] [--traces N] [--batch N] [--iterations N] [--out report.json]
+  newdb bench   (--data <dir> | --memory) [--no-fsync] [--no-seal] [--traces N] [--batch N] [--iterations N] [--out report.json]
   newdb bench   --compare a.json b.json";
 
 /// What went wrong: bad arguments (exit 2) or a failed command (exit 1).
@@ -85,7 +93,7 @@ fn run(args: &[String]) -> Result<ExitCode, Fail> {
         "bench" => bench(&Args::parse(
             rest,
             &["data", "traces", "batch", "iterations", "out"],
-            &["no-fsync", "memory", "compare"],
+            &["no-fsync", "no-seal", "memory", "compare"],
         )?),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
@@ -172,14 +180,17 @@ impl Args {
             (Some(_), true) => Err(Fail::Usage("use --data or --memory, not both".into())),
             (None, false) => Err(Fail::Usage("--data <dir> or --memory is required".into())),
             (None, true) => Ok(Arc::new(Oracle::new())),
-            (Some(dir), false) => {
-                let config = Config {
-                    fsync: !self.has("no-fsync"),
-                    ..Config::default()
-                };
-                Ok(Arc::new(Db::open(dir, config)?))
-            }
+            (Some(_), false) => Ok(Arc::new(self.engine()?)),
         }
+    }
+
+    /// The engine on `--data <dir>`, honoring `--no-fsync`.
+    fn engine(&self) -> Result<Db, Fail> {
+        let config = Config {
+            fsync: !self.has("no-fsync"),
+            ..Config::default()
+        };
+        Ok(Db::open(self.data()?, config)?)
     }
 }
 
@@ -322,8 +333,18 @@ fn bench(a: &Args) -> Result<ExitCode, Fail> {
     if let Some(n) = a.number("iterations")? {
         config.iterations = n;
     }
-    let store = a.store()?;
-    let report = newdb_tools::run_bench(store.as_ref(), &config)?;
+    let report = match (a.get("data"), a.has("memory")) {
+        (Some(_), false) => {
+            let db = a.engine()?;
+            let seal = !a.has("no-seal");
+            let report = newdb_tools::run_bench_with(&db, &config, &mut || {
+                if seal { db.seal_active() } else { Ok(()) }
+            })?;
+            db.close()?;
+            report
+        }
+        _ => newdb_tools::run_bench(a.store()?.as_ref(), &config)?,
+    };
     let json = report.to_json();
     if let Some(out) = a.get("out") {
         std::fs::write(out, &json).map_err(|e| Fail::Run(format!("writing {out}: {e}")))?;
