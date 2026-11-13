@@ -58,14 +58,6 @@ pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Writes `path` via a temporary file and a rename, then fsyncs the directory.
-pub(crate) fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
-    let tmp = dir.join(format!(".{name}.tmp"));
-    write_synced(&tmp, bytes)?;
-    fs::rename(&tmp, dir.join(name))?;
-    sync_dir(dir)
-}
-
 pub(crate) fn remove_dir_if_exists(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
@@ -113,7 +105,9 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// Layout file names are plain names inside the layout's directory.
 pub(crate) fn check_file_name(name: &str) -> Result<()> {
     if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']) {
-        return Err(Error::InvalidInput(format!("bad layout file name {name:?}")));
+        return Err(Error::InvalidInput(format!(
+            "bad layout file name {name:?}"
+        )));
     }
     Ok(())
 }
