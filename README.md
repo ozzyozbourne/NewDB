@@ -18,8 +18,8 @@ scripts/check         # fmt, layering lint, clippy, every Rust test, Python end-
 scripts/release       # LTO build (target/dist/newdb) and a reference bench run
 ```
 
-For a quick binary: `cargo build --profile bench -p newdb-cli --locked`, which writes
-`target/release/newdb`.
+For a quick optimized binary: `cargo build --profile bench -p newdb-cli --locked`, which
+writes `target/release/newdb`.
 
 ## Use it
 
@@ -88,50 +88,61 @@ newdb bench   --compare before.json after.json
 
 ## Performance
 
-Measured on 2026-11-13 at `main` 5bfe432 with `newdb bench --preset forge`: 1.19M posts,
-158k traces plus 20 traces of 2,000 spans, 2 KB median payloads, 12 hourly partitions,
-1.6 GB on disk. The machine is an Amp orb with 8 vCPU (4 cores with 2 hyperthreads each,
-Xeon at 2.6 GHz) and 16 GB of RAM, unless a row says otherwise. Forge numbers are from
-[DESIGN.md](DESIGN.md) section 1. The two workload generators differ, so compare orders of
-magnitude, not percentages.
+Measured on 2026-11-13 at `main` c7a615d, built with `--profile bench` (thin LTO, the
+same optimization as release builds). Most rows use `newdb bench --preset forge`: 1.19M
+posts, 158k traces plus 20 traces of 2,000 spans, 2 KB median payloads, 12 hourly
+partitions, 1.6 GB on disk. The machine is an Amp orb with 8 vCPU (4 cores with 2
+hyperthreads each, Xeon at 2.6 GHz) and 16 GB of RAM, unless a row says otherwise. Forge
+numbers are from [DESIGN.md](DESIGN.md) section 1. The two workload generators differ, so
+compare orders of magnitude, not percentages.
 
 | Operation | Target | NewDB | Forge |
 | --- | --- | --- | --- |
-| Ingest, fsync on, 4 concurrent callers | ≥ 100k posts/s | 99–102k posts/s | 23–28k |
-| Ingest, fsync on, 1 caller | | 67–71k posts/s | |
-| Ingest, fsync off, 4 callers | | 119–126k posts/s | |
-| 2,000-span trace with payloads, warm, p50 | ≤ 5 ms | 2.4 ms on a 6-core Apple M4; 7.1 ms on the orb | 45–70 ms |
-| Same trace, no payloads | | 1.2 ms | 23–27 ms |
-| Same trace, cold (page cache dropped), first read | ≤ 50 ms | 24–40 ms | not measured |
-| Newest 50 runs | ≤ 1 ms | 0.027 ms (errors only: 0.15–0.27 ms) | 62–85 ms |
-| Same, cold, all partitions sealed | | 0.6 ms | |
-| Full-text search, newest 50 hits | ≤ 20 ms | 5–12 ms; cold 58–87 ms | 19–765 ms |
-| Open a database (all partitions sealed) | ≤ 50 ms + replay | 100–170 ms, plus replay at ~42k posts/s | — |
-| Idle memory (`newdb serve`) | ≤ 30 MiB | 4.3 MB | 30 MiB |
-| One-line layout change: rebuild + its tests | ≤ 10 s | ~1 s + 7 s | — |
-| Clean release (LTO) build | ≤ 2 min | 42 s, 2.9 MB binary | 15 min |
+| Ingest, fsync on, 4 concurrent callers | ≥ 100k posts/s | 113–116k posts/s | 23–28k |
+| Ingest, fsync on, 1 caller | | 72–73k posts/s | |
+| Ingest, fsync off, 1 / 4 callers | | 86–88k / 107–118k posts/s | |
+| 2,000-span trace with payloads, warm, p50 | ≤ 5 ms | 3.4–3.9 ms (p99 3.9–4.6) | 45–70 ms |
+| Same trace, no payloads | | 0.74 ms | 23–27 ms |
+| Same trace, cold (page cache dropped), first read | ≤ 50 ms | 62–92 ms (missed, see notes) | not measured |
+| Newest 50 runs | ≤ 1 ms | 0.022 ms (errors only: 0.13–0.14 ms) | 62–85 ms |
+| Same, cold | | 0.65–0.83 ms | |
+| Full-text search, newest 50 hits | ≤ 20 ms | 0.96–1.0 ms (p99 1.0–1.2); cold 67–82 ms | 19–765 ms |
+| Same search with 688 partitions (96k traces sealed every 1,000 posts) | | 1.15 ms (p99 1.6) | |
+| Open a database, all partitions sealed | ≤ 50 ms + replay | 1.9 ms warm, 16 ms cold | — |
+| Open with the active hour unsealed (92k posts to replay) | | 1.7–1.9 s warm, 1.9–2.0 s cold | — |
+| Idle memory (`newdb serve`, forge data open) | ≤ 30 MiB | 6.4 MB | 30 MiB |
+| One-line layout change: rebuild + its tests | ≤ 10 s | about 1 s + 7.5 s | — |
+| Clean release (LTO) build | ≤ 2 min | 45 s, 2.9 MB binary | 15 min |
 
 Notes:
 
-- **Ingest** is durable when `ingest` returns, by design. A single caller is bounded by
-  preparing a batch and then waiting for its `fdatasync`. Several callers overlap the two
-  and reach the target. Ingest numbers are sustained rates, timed until a read sees every
-  post, on a dedicated 8-vCPU orb.
+- **Ingest** is durable when `ingest` returns, by design. The ingest rows are sustained
+  rates without seals: 218k pre-generated posts in batches of 1,000, timed until a read
+  sees every post. A single caller is bounded by preparing a batch and then waiting for
+  its `fdatasync`; several callers overlap the two and reach the target. Ingest inside
+  the forge bench, which also seals every 100k posts, is 66–69k posts/s with one caller.
 - **Trace load with payloads** is bound by zstd decompression (about 12 MB of payloads
-  for the 2,000-span trace). It is split across a read pool and meets the target on a
-  developer laptop. On the 4-core hyperthreaded VM it stops at about 7–8 ms, because
-  every thread decompresses about 1.5× slower when all 8 run at once. Meeting the target
-  on the laptop counts as met.
-- **Seals** happen hourly. Payloads are then re-framed per trace in the background
-  (64 KiB zstd frames), which cut disk use by 16%. Ingest does not wait for it. Large
-  trace loads that overlap it (about 1–2 s per partition here) can reach a p99 of about
+  for the 2,000-span trace), split across a read pool. In process, `Db::with_trace`
+  skips copying the payloads out.
+- **Cold trace load** misses its target since sealed partitions validate their payload
+  index on first use instead of at open. Cold open dropped from 160–210 ms (on the
+  earlier non-LTO build) to 16 ms, and open plus first read is faster overall (about
+  75–105 ms, against about 185–255 ms), but the first read now reads the index from
+  disk. With the index pages
+  already cached, the same cold load takes 36 ms.
+- **Search** keeps spread traces (traces with posts in more than one partition) merged
+  across sealed partitions between queries, so it stays near 1 ms as partitions
+  accumulate. The first search after opening builds that cache: about 110 ms at 688
+  partitions.
+- **Seals** happen hourly (here every 100k posts): 0.93–0.96 s p50, and ingest does not
+  wait for them. Payloads are then re-framed per trace in the background (64 KiB zstd
+  level-3 frames). Large trace loads that overlap re-framing can reach a p99 of about
   20 ms.
-- **Opening** replays the active (unsealed) hour's log to rebuild its in-memory layouts.
-  With about 92k unsealed posts that took 2.2–2.8 s, against 100–170 ms with everything
-  sealed. A restart late in a busy hour pays that cost.
+- **Opening** replays the active (unsealed) hour's log to rebuild its in-memory layouts,
+  at about 50k posts/s on one thread. A restart late in a busy hour pays that cost.
 - **Cold** means the page cache was dropped (`echo 3 > /proc/sys/vm/drop_caches`) and the
   read is the first in a new read-only process. The opening time is listed separately.
 - Peak memory of the whole forge bench process, workload generation included, is about
-  425 MB.
+  460 MB.
 
 NewDB has no SQL. A new question is a Rust or Python loop over runs or layout readers.
