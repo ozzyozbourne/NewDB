@@ -64,6 +64,10 @@ fn bad_arguments_exit_2_with_usage() {
         &["serve", "--memory", "--addr", "localhost"],
         &["serve", "--memory", "--mapping", "m.json"],
         &["serve", "--memory", "--pricing", "p.json"],
+        &["bench", "--memory", "--seal-every", "10"],
+        &["bench", "--memory", "--preset", "forge"],
+        &["bench", "--memory", "--preset", "nope"],
+        &["bench", "--memory", "--max-depth", "-1"],
         &["inspect"],
         &["verify", "--data"],
         &["rebuild", "--data", "d", "--bogus"],
@@ -208,5 +212,70 @@ fn bench_on_a_real_db_seals_and_inspect_verify_rebuild_check_it() {
     let out = String::from_utf8_lossy(&o.stdout);
     assert_eq!(o.status.code(), Some(1), "{out}{}", stderr(&o));
     assert!(out.contains("problem: "), "{out}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn bench_seal_every_spreads_the_workload_over_partitions_and_reads_whole_target_traces() {
+    let dir = std::env::temp_dir().join(format!("newdb-cli-seal-every-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let data = dir.join("db");
+    let data = data.to_str().unwrap();
+    let o = newdb(&[
+        "bench",
+        "--data",
+        data,
+        "--no-fsync",
+        "--traces",
+        "30",
+        "--payload-median",
+        "64",
+        "--target-trace-spans",
+        "300",
+        "--target-traces",
+        "2",
+        "--seal-every",
+        "100",
+        "--batch",
+        "50",
+        "--iterations",
+        "2",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let r = BenchReport::from_json(&String::from_utf8(o.stdout).unwrap()).unwrap();
+    assert_eq!(r.trace_spans, 300, "the target trace is read back whole");
+    assert_eq!(r.seals, r.posts / 100);
+    assert!(!r.posts.is_multiple_of(100) && r.seals >= 5, "{r:?}");
+    assert_eq!(
+        r.partitions,
+        Some(r.seals + 1),
+        "sealed ones plus the active one"
+    );
+    assert!(r.bytes_on_disk.unwrap() > 0);
+
+    let o = newdb(&["inspect", "--data", data]);
+    let inspect = String::from_utf8(o.stdout).unwrap();
+    let rows: Vec<Vec<&str>> = inspect
+        .lines()
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(rows.len() as u64, r.seals + 1, "{inspect}");
+    assert_eq!(
+        rows.iter().filter(|c| c[1] == "yes").count() as u64,
+        r.seals
+    );
+    let posts: u64 = rows.iter().map(|c| c[2].parse::<u64>().unwrap()).sum();
+    assert_eq!(posts, r.posts, "{inspect}");
+    let o = newdb(&["verify", "--data", data]);
+    assert_eq!(
+        String::from_utf8(o.stdout).unwrap(),
+        format!(
+            "verified {} partitions, {} layouts: 0 problems\n",
+            r.seals,
+            r.seals * 4
+        )
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
