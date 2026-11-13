@@ -17,9 +17,9 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use newdb_testkit::r#gen::{GenConfig, generate};
+use newdb_testkit::r#gen::{GenConfig, Rng, generate};
 use newdb_types::{
-    Error, Result, RunQuery, RunType, SearchQuery, SpanId, Status, Store, TraceId, TraceQuery,
+    Error, Result, RunQuery, RunType, SearchQuery, Span, SpanId, Status, Store, TraceId, TraceQuery,
 };
 
 /// What a bench run does.
@@ -30,6 +30,15 @@ pub struct BenchConfig {
     pub batch: usize,
     /// Repetitions of each read, for p50/p99.
     pub iterations: usize,
+    /// When set, `target_traces` traces of exactly this many spans are spread evenly
+    /// through the workload, and the `trace_largest_*` reads load the first (oldest) of
+    /// them instead of the largest generated trace.
+    pub target_trace_spans: Option<usize>,
+    pub target_traces: usize,
+    /// Call the seal hook of [`run_bench_with`] after every this many posts (0: never).
+    pub seal_every: usize,
+    /// Call the seal hook once more after the ingest, before the reads.
+    pub seal_at_end: bool,
 }
 
 impl Default for BenchConfig {
@@ -38,9 +47,38 @@ impl Default for BenchConfig {
             workload: GenConfig::default(),
             batch: 1000,
             iterations: 50,
+            target_trace_spans: None,
+            target_traces: 3,
+            seal_every: 0,
+            seal_at_end: false,
         }
     }
 }
+
+impl BenchConfig {
+    /// A named workload. `forge` is the Forge Trace DB / xitdb comparison of DESIGN.md
+    /// section 1: about 1.2M posts with 2 KB median payloads, 20 traces of exactly 2,000
+    /// spans, sealed every 100k posts.
+    pub fn preset(name: &str) -> Option<BenchConfig> {
+        match name {
+            "forge" => Some(BenchConfig {
+                workload: GenConfig {
+                    traces: FORGE_TRACES,
+                    payload_median: 2048,
+                    ..GenConfig::default()
+                },
+                target_trace_spans: Some(2000),
+                target_traces: 20,
+                seal_every: 100_000,
+                ..BenchConfig::default()
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Generated traces in `--preset forge`; with 2 KB payloads they make about 1.2M posts.
+const FORGE_TRACES: usize = 158_500;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Latency {
@@ -51,7 +89,17 @@ pub struct Latency {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BenchReport {
     pub posts: u64,
+    /// Partitions after the run and bytes in the data directory; `None` for stores without
+    /// them (the oracle). The CLI fills these in.
+    pub partitions: Option<u64>,
+    pub bytes_on_disk: Option<u64>,
+    /// Spans the `trace_largest_*` reads return.
+    pub trace_spans: u64,
+    /// Posts per second spent in `ingest` calls (generation and seals not counted).
     pub ingest_posts_per_sec: f64,
+    /// Seal hook calls and their latency.
+    pub seals: u64,
+    pub seal: Latency,
     /// `(read name, latency)`, e.g. `("trace_largest_with_payloads", ...)`,
     /// `("runs_newest_50", ...)`, `("runs_errors_50", ...)`, `("search_refund_policy", ...)`.
     pub reads: Vec<(String, Latency)>,
@@ -72,47 +120,71 @@ pub fn run_bench(store: &dyn Store, config: &BenchConfig) -> Result<BenchReport>
     run_bench_with(store, config, &mut || Ok(()))
 }
 
-/// [`run_bench`], calling `after_ingest` between the ingest and the reads, untimed. The CLI
-/// seals the engine's active partition there, so the reads walk sealed, mapped files.
+/// [`run_bench`] with a seal hook, called (and timed, outside the ingest rate) after every
+/// `config.seal_every` posts and, with `config.seal_at_end`, once after the ingest. The CLI
+/// passes `Db::seal_active`, so the reads walk sealed, mapped partitions.
 pub fn run_bench_with(
     store: &dyn Store,
     config: &BenchConfig,
-    after_ingest: &mut dyn FnMut() -> Result<()>,
+    seal: &mut dyn FnMut() -> Result<()>,
 ) -> Result<BenchReport> {
-    let posts = generate(&config.workload);
-    let total = posts.len() as u64;
+    let batch = config.batch.max(1);
+    let mut total = 0u64;
+    let mut ingest_time = Duration::ZERO;
+    let mut since_seal = 0usize;
+    let mut seal_times = Vec::new();
+    let mut timed_seal = |seal_times: &mut Vec<Duration>| -> Result<()> {
+        let t = Instant::now();
+        seal()?;
+        seal_times.push(t.elapsed());
+        Ok(())
+    };
+    let mut send = |posts: Vec<Span>| -> Result<()> {
+        let n = posts.len();
+        let t = Instant::now();
+        store.ingest(posts)?;
+        ingest_time += t.elapsed();
+        total += n as u64;
+        since_seal += n;
+        if config.seal_every > 0 && since_seal >= config.seal_every {
+            since_seal = 0;
+            timed_seal(&mut seal_times)?;
+        }
+        Ok(())
+    };
 
-    // The largest trace by distinct spans, found before the posts move into the store.
-    let mut spans_per_trace: HashMap<(&str, TraceId), Vec<SpanId>> = HashMap::new();
-    for p in &posts {
-        spans_per_trace
-            .entry((p.project.as_str(), p.trace_id))
-            .or_default()
-            .push(p.span_id);
-    }
-    let (project, trace_id) = spans_per_trace
-        .into_iter()
-        .map(|(k, mut ids)| {
-            ids.sort_unstable();
-            ids.dedup();
-            (ids.len(), k)
-        })
-        .max()
-        .map(|(_, (p, t))| (p.to_string(), t))
-        .ok_or_else(|| Error::InvalidInput("bench workload has no posts".into()))?;
-
+    // Generated a chunk at a time, so a workload larger than memory streams through.
+    let mut largest: Option<(usize, String, TraceId)> = None;
+    let mut target: Option<(String, TraceId)> = None;
     CountingAlloc::enable();
     let allocs_before_ingest = CountingAlloc::count();
-    let mut posts = posts;
-    let batch = config.batch.max(1);
-    let t0 = Instant::now();
-    while !posts.is_empty() {
-        let rest = posts.split_off(batch.min(posts.len()));
-        store.ingest(std::mem::replace(&mut posts, rest))?;
+    let mut pending: Vec<Span> = Vec::new();
+    for chunk in chunks(config) {
+        let (is_target, posts) = chunk?;
+        if is_target {
+            if target.is_none() {
+                target = posts.first().map(|p| (p.project.clone(), p.trace_id));
+            }
+        } else {
+            largest = largest.max(largest_trace(&posts));
+        }
+        pending.extend(posts);
+        while pending.len() >= batch {
+            let rest = pending.split_off(batch);
+            send(std::mem::replace(&mut pending, rest))?;
+        }
     }
-    let ingest_secs = t0.elapsed().as_secs_f64();
+    if !pending.is_empty() {
+        send(pending)?;
+    }
     let counting = CountingAlloc::count() > allocs_before_ingest;
-    after_ingest()?;
+    if config.seal_at_end {
+        timed_seal(&mut seal_times)?;
+    }
+    let (project, trace_id) = target
+        .or(largest.map(|(_, p, t)| (p, t)))
+        .ok_or_else(|| Error::InvalidInput("bench workload has no posts".into()))?;
+    let ingest_secs = ingest_time.as_secs_f64();
 
     let trace = |payloads: bool| TraceQuery {
         project: project.clone(),
@@ -169,12 +241,23 @@ pub fn run_bench_with(
     ];
 
     let iterations = config.iterations.max(1);
+    seal_times.sort_unstable();
     let mut report = BenchReport {
         posts: total,
+        trace_spans: store.trace(&trace(false))?.value.len() as u64,
         ingest_posts_per_sec: if ingest_secs > 0.0 {
             total as f64 / ingest_secs
         } else {
             0.0
+        },
+        seals: seal_times.len() as u64,
+        seal: if seal_times.is_empty() {
+            Latency::default()
+        } else {
+            Latency {
+                p50: percentile(&seal_times, 50),
+                p99: percentile(&seal_times, 99),
+            }
         },
         ..Default::default()
     };
@@ -207,6 +290,95 @@ pub fn run_bench_with(
     Ok(report)
 }
 
+/// Traces per generated chunk.
+const CHUNK_TRACES: usize = 2000;
+
+/// The bench workload in delivery order, a chunk of posts at a time; `true` marks a target
+/// trace. Chunk `i` is `generate` over traces `i * CHUNK_TRACES ..`, with its own seed and
+/// start times continuing the previous chunk's, so a workload that fits in one chunk is
+/// exactly `generate(&config.workload)`. Target traces come before the chunk where they
+/// fall when spread evenly, starting with that chunk's first trace.
+fn chunks(config: &BenchConfig) -> impl Iterator<Item = Result<(bool, Vec<Span>)>> + '_ {
+    let w = &config.workload;
+    let n = w.traces.div_ceil(CHUNK_TRACES).max(1);
+    let targets = match config.target_trace_spans {
+        Some(_) => config.target_traces,
+        None => 0,
+    };
+    (0..n).flat_map(move |i| {
+        let first = i * CHUNK_TRACES;
+        let base_ns = w.base_ns + first as u64 * w.trace_gap_ns;
+        let targets = (0..targets)
+            .filter(move |k| k * n / targets == i)
+            .map(move |k| target_trace(config, k, base_ns).map(|p| (true, p)));
+        let cfg = GenConfig {
+            seed: if i == 0 {
+                w.seed
+            } else {
+                mix(w.seed, i as u64)
+            },
+            traces: w.traces.saturating_sub(first).min(CHUNK_TRACES),
+            base_ns,
+            ..w.clone()
+        };
+        targets.chain(std::iter::once_with(move || Ok((false, generate(&cfg)))))
+    })
+}
+
+/// Target trace `k`: one generated trace of exactly `target_trace_spans` spans. A root
+/// fan-out with no practical limit makes the tree grow until the span cap; the rare draw
+/// that stops short is retried with the next seed.
+fn target_trace(config: &BenchConfig, k: usize, base_ns: u64) -> Result<Vec<Span>> {
+    let n = config.target_trace_spans.unwrap_or(0);
+    if n == 0 {
+        return Err(Error::InvalidInput(
+            "target trace spans must be at least 1".into(),
+        ));
+    }
+    for attempt in 0..16u64 {
+        let cfg = GenConfig {
+            seed: mix(config.workload.seed, (1 << 40) + k as u64 * 16 + attempt),
+            traces: 1,
+            max_spans_per_trace: n,
+            max_depth: 2,
+            max_fanout: u32::MAX,
+            base_ns,
+            ..config.workload.clone()
+        };
+        let posts = generate(&cfg);
+        if largest_trace(&posts).is_some_and(|(spans, _, _)| spans == n) {
+            return Ok(posts);
+        }
+    }
+    Err(Error::InvalidInput(format!(
+        "could not generate a trace of exactly {n} spans"
+    )))
+}
+
+fn mix(seed: u64, salt: u64) -> u64 {
+    Rng::new(seed ^ salt.wrapping_mul(0x9e37_79b9_7f4a_7c15)).next_u64()
+}
+
+/// The trace with the most distinct spans: `(spans, project, trace_id)`, ties broken by
+/// the larger `(project, trace_id)`.
+fn largest_trace(posts: &[Span]) -> Option<(usize, String, TraceId)> {
+    let mut spans_per_trace: HashMap<(&str, TraceId), Vec<SpanId>> = HashMap::new();
+    for p in posts {
+        spans_per_trace
+            .entry((p.project.as_str(), p.trace_id))
+            .or_default()
+            .push(p.span_id);
+    }
+    spans_per_trace
+        .into_iter()
+        .map(|((p, t), mut ids)| {
+            ids.sort_unstable();
+            ids.dedup();
+            (ids.len(), p.to_string(), t)
+        })
+        .max()
+}
+
 /// Nearest-rank percentile of sorted, non-empty `xs`.
 fn percentile<T: Copy>(xs: &[T], p: usize) -> T {
     let rank = (xs.len() * p).div_ceil(100).max(1);
@@ -221,19 +393,34 @@ impl BenchReport {
         } else {
             0.0
         };
+        let opt = |v: Option<u64>| v.map_or("null".to_string(), |v| v.to_string());
+        let latency = |l: &Latency| {
+            format!(
+                "{{\"p50_ns\": {}, \"p99_ns\": {}}}",
+                l.p50.as_nanos(),
+                l.p99.as_nanos()
+            )
+        };
         let _ = write!(
             s,
-            "{{\n  \"posts\": {},\n  \"ingest_posts_per_sec\": {:?},\n  \"reads\": {{",
-            self.posts, rate
+            "{{\n  \"posts\": {},\n  \"partitions\": {},\n  \"bytes_on_disk\": {},\n  \
+             \"trace_spans\": {},\n  \"ingest_posts_per_sec\": {:?},\n  \"seals\": {},\n  \
+             \"seal\": {},\n  \"reads\": {{",
+            self.posts,
+            opt(self.partitions),
+            opt(self.bytes_on_disk),
+            self.trace_spans,
+            rate,
+            self.seals,
+            latency(&self.seal)
         );
         for (i, (name, l)) in self.reads.iter().enumerate() {
             let _ = write!(
                 s,
-                "{}\n    {}: {{\"p50_ns\": {}, \"p99_ns\": {}}}",
+                "{}\n    {}: {}",
                 if i == 0 { "" } else { "," },
                 json_string(name),
-                l.p50.as_nanos(),
-                l.p99.as_nanos()
+                latency(l)
             );
         }
         s.push_str(if self.reads.is_empty() {
@@ -273,18 +460,15 @@ impl BenchReport {
         for (k, v) in top {
             match k.as_str() {
                 "posts" => r.posts = v.u64(k)?,
+                "partitions" => r.partitions = v.opt_u64(k)?,
+                "bytes_on_disk" => r.bytes_on_disk = v.opt_u64(k)?,
+                "trace_spans" => r.trace_spans = v.u64(k)?,
                 "ingest_posts_per_sec" => r.ingest_posts_per_sec = v.f64(k)?,
+                "seals" => r.seals = v.u64(k)?,
+                "seal" => r.seal = v.latency(k)?,
                 "reads" => {
                     for (name, v) in v.object(k)? {
-                        let mut l = Latency::default();
-                        for (f, v) in v.object(name)? {
-                            match f.as_str() {
-                                "p50_ns" => l.p50 = Duration::from_nanos(v.u64(f)?),
-                                "p99_ns" => l.p99 = Duration::from_nanos(v.u64(f)?),
-                                _ => {}
-                            }
-                        }
-                        r.reads.push((name.clone(), l));
+                        r.reads.push((name.clone(), v.latency(name)?));
                     }
                 }
                 "allocations" => {
@@ -300,8 +484,27 @@ impl BenchReport {
 
     /// Side-by-side table of two reports with the change in percent.
     pub fn compare(&self, other: &BenchReport) -> String {
+        let count = |name: &str, x: Option<u64>, y: Option<u64>| -> [String; 4] {
+            [
+                name.into(),
+                x.map_or("-".into(), |v| v.to_string()),
+                y.map_or("-".into(), |v| v.to_string()),
+                match (x, y) {
+                    (Some(x), Some(y)) => change(x as f64, y as f64),
+                    _ => "-".into(),
+                },
+            ]
+        };
         let mut rows: Vec<[String; 4]> = vec![
             ["".into(), "a".into(), "b".into(), "change".into()],
+            count("posts", Some(self.posts), Some(other.posts)),
+            count("partitions", self.partitions, other.partitions),
+            count("bytes on disk", self.bytes_on_disk, other.bytes_on_disk),
+            count(
+                "trace spans",
+                Some(self.trace_spans),
+                Some(other.trace_spans),
+            ),
             [
                 "ingest posts/s".into(),
                 format!("{:.0}", self.ingest_posts_per_sec),
@@ -309,6 +512,20 @@ impl BenchReport {
                 change(self.ingest_posts_per_sec, other.ingest_posts_per_sec),
             ],
         ];
+        if self.seals + other.seals > 0 {
+            rows.push(count("seals", Some(self.seals), Some(other.seals)));
+            for (pct, x, y) in [
+                ("p50", self.seal.p50, other.seal.p50),
+                ("p99", self.seal.p99, other.seal.p99),
+            ] {
+                rows.push([
+                    format!("seal {pct}"),
+                    fmt_duration(x),
+                    fmt_duration(y),
+                    change(x.as_secs_f64(), y.as_secs_f64()),
+                ]);
+            }
+        }
         let mut names: Vec<&str> = self.reads.iter().map(|(n, _)| n.as_str()).collect();
         for (n, _) in &other.reads {
             if !names.contains(&n.as_str()) {
@@ -422,6 +639,7 @@ enum Json {
     Object(Vec<(String, Json)>),
     String,
     Number(String),
+    Null,
     Other,
 }
 
@@ -441,6 +659,25 @@ impl Json {
             _ => None,
         }
         .ok_or_else(|| Error::InvalidInput(format!("bench report: {what} is not an integer")))
+    }
+
+    fn opt_u64(&self, what: &str) -> Result<Option<u64>> {
+        match self {
+            Json::Null => Ok(None),
+            v => v.u64(what).map(Some),
+        }
+    }
+
+    fn latency(&self, what: &str) -> Result<Latency> {
+        let mut l = Latency::default();
+        for (f, v) in self.object(what)? {
+            match f.as_str() {
+                "p50_ns" => l.p50 = Duration::from_nanos(v.u64(f)?),
+                "p99_ns" => l.p99 = Duration::from_nanos(v.u64(f)?),
+                _ => {}
+            }
+        }
+        Ok(l)
     }
 
     fn f64(&self, what: &str) -> Result<f64> {
@@ -532,10 +769,14 @@ impl Parser<'_> {
                 Ok(Json::Number(n.to_string()))
             }
             _ => {
-                for word in ["true", "false", "null"] {
+                for (word, v) in [
+                    ("true", Json::Other),
+                    ("false", Json::Other),
+                    ("null", Json::Null),
+                ] {
                     if self.s[self.i..].starts_with(word.as_bytes()) {
                         self.i += word.len();
-                        return Ok(Json::Other);
+                        return Ok(v);
                     }
                 }
                 Err(self.err("unexpected character"))
@@ -654,6 +895,7 @@ mod tests {
             workload: GenConfig::small(3),
             batch: 7,
             iterations: 5,
+            ..BenchConfig::default()
         }
     }
 
@@ -694,17 +936,119 @@ mod tests {
     }
 
     #[test]
-    fn after_ingest_runs_once_between_the_ingest_and_the_reads() {
+    fn large_workloads_stream_in_chunks_with_target_traces_spread_through_them() {
+        let cfg = BenchConfig {
+            workload: GenConfig {
+                traces: CHUNK_TRACES + 5,
+                ..GenConfig::small(5)
+            },
+            target_trace_spans: Some(40),
+            target_traces: 3,
+            ..BenchConfig::default()
+        };
+        let chunks: Vec<(bool, Vec<Span>)> = chunks(&cfg).map(Result::unwrap).collect();
+        let kinds: Vec<bool> = chunks.iter().map(|c| c.0).collect();
+        assert_eq!(kinds, [true, true, false, true, false]);
+
+        // The first chunk is exactly what one generate call gives, so small benches are
+        // unchanged; later chunks continue the trace numbering and start times.
+        let w = &cfg.workload;
+        let one = GenConfig {
+            traces: CHUNK_TRACES,
+            ..w.clone()
+        };
+        assert_eq!(chunks[2].1, generate(&one));
+        let mut roots: Vec<(u64, TraceId)> = chunks
+            .iter()
+            .filter(|c| !c.0)
+            .flat_map(|c| &c.1)
+            .filter(|s| s.is_root() && s.start_ns.is_some())
+            .map(|s| (s.start_ns.unwrap(), s.trace_id))
+            .collect();
+        roots.sort();
+        roots.dedup();
+        let starts: Vec<u64> = roots.iter().map(|r| r.0).collect();
+        let want: Vec<u64> = (0..w.traces as u64)
+            .map(|t| w.base_ns + t * w.trace_gap_ns)
+            .collect();
+        assert_eq!(starts, want);
+
+        for (i, (_, posts)) in chunks.iter().enumerate().filter(|c| c.1.0) {
+            let (spans, _, _) = largest_trace(posts).unwrap();
+            assert_eq!(spans, 40, "target chunk {i}");
+            let root = posts.iter().find(|s| s.is_root() && s.start_ns.is_some());
+            let chunk_base = if i < 2 { 0 } else { CHUNK_TRACES as u64 };
+            assert_eq!(
+                root.unwrap().start_ns,
+                Some(w.base_ns + chunk_base * w.trace_gap_ns)
+            );
+        }
+        let ids: std::collections::HashSet<TraceId> = chunks
+            .iter()
+            .flat_map(|c| &c.1)
+            .map(|s| s.trace_id)
+            .collect();
+        assert_eq!(ids.len(), w.traces + 3, "every trace has its own ID");
+    }
+
+    #[test]
+    fn target_traces_have_exactly_the_requested_spans_and_are_the_ones_read() {
+        let cfg = BenchConfig {
+            target_trace_spans: Some(2000),
+            ..small()
+        };
+        let posts = target_trace(&cfg, 0, 7).unwrap();
+        assert_eq!(largest_trace(&posts).unwrap().0, 2000);
+
+        let cfg = BenchConfig {
+            target_trace_spans: Some(50),
+            ..small()
+        };
+        let report = run_bench(&Oracle::new(), &cfg).unwrap();
+        // GenConfig::small caps generated traces at 30 spans.
+        assert_eq!(report.trace_spans, 50);
+        let largest = largest_trace(&generate(&small().workload)).unwrap().0;
+        assert_eq!(
+            run_bench(&Oracle::new(), &small()).unwrap().trace_spans,
+            largest as u64
+        );
+        let zero = BenchConfig {
+            target_trace_spans: Some(0),
+            ..small()
+        };
+        assert!(run_bench(&Oracle::new(), &zero).is_err());
+    }
+
+    #[test]
+    fn the_seal_hook_runs_every_n_posts_and_once_at_the_end() {
         let oracle = Oracle::new();
-        let cfg = small();
+        let cfg = BenchConfig {
+            batch: 5,
+            seal_every: 10,
+            ..small()
+        };
         let mut seen = Vec::new();
-        run_bench_with(&oracle, &cfg, &mut || {
+        let report = run_bench_with(&oracle, &cfg, &mut || {
             seen.push(oracle.len());
             Ok(())
         })
         .unwrap();
-        assert_eq!(seen.len(), 1);
-        assert!(seen[0] > 0, "the workload was ingested first");
+        assert_eq!(report.seals, report.posts / 10);
+        assert_eq!(seen.len() as u64, report.seals);
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "{seen:?}");
+        assert!(report.seal.p50 <= report.seal.p99);
+
+        let at_end = BenchConfig {
+            seal_at_end: true,
+            ..cfg.clone()
+        };
+        let mut seals = 0;
+        let report = run_bench_with(&Oracle::new(), &at_end, &mut || {
+            seals += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seals, report.posts / 10 + 1);
         let fail = run_bench_with(&Oracle::new(), &cfg, &mut || Err(Error::ReadOnly));
         assert!(matches!(fail, Err(Error::ReadOnly)));
     }
@@ -721,7 +1065,15 @@ mod tests {
     fn sample() -> BenchReport {
         BenchReport {
             posts: 18_446_744_073_709_551_615,
+            partitions: Some(3),
+            bytes_on_disk: None,
+            trace_spans: 2000,
             ingest_posts_per_sec: 123_456.789_012_345,
+            seals: 12,
+            seal: Latency {
+                p50: Duration::from_millis(40),
+                p99: Duration::from_millis(90),
+            },
             reads: vec![
                 (
                     "trace \"q\"\\x".into(),
@@ -754,14 +1106,17 @@ mod tests {
     fn json_reader_accepts_other_writers_and_rejects_garbage() {
         let r = BenchReport::from_json(
             r#" {"extra": [1, true, null, {"x": "y"}], "reads": {"a\u0062": {"p99_ns": 5, "p50_ns": 2}},
-               "ingest_posts_per_sec": 1.5e3, "posts": 10} "#,
+               "ingest_posts_per_sec": 1.5e3, "posts": 10, "partitions": null, "bytes_on_disk": 7} "#,
         )
         .unwrap();
         assert_eq!(r.posts, 10);
         assert_eq!(r.ingest_posts_per_sec, 1500.0);
         assert_eq!(r.reads[0].0, "ab");
         assert_eq!(r.reads[0].1.p50, Duration::from_nanos(2));
+        assert_eq!((r.partitions, r.bytes_on_disk), (None, Some(7)));
         for bad in [
+            "{\"partitions\": true}",
+            "{\"seal\": 1}",
             "",
             "{",
             "{\"posts\": 1.5}",
@@ -778,6 +1133,7 @@ mod tests {
         let a = sample();
         let mut b = sample();
         b.ingest_posts_per_sec = a.ingest_posts_per_sec * 2.0;
+        b.partitions = Some(6);
         b.reads[1].1.p50 = Duration::from_micros(60);
         b.reads.push(("new_read".into(), Latency::default()));
         let table = a.compare(&b);
@@ -791,6 +1147,10 @@ mod tests {
                 .join(" ")
         };
         assert_eq!(line("ingest"), "ingest posts/s 123457 246914 +100.0%");
+        assert_eq!(line("partitions"), "partitions 3 6 +100.0%");
+        assert_eq!(line("bytes on disk"), "bytes on disk - - -");
+        assert_eq!(line("trace spans"), "trace spans 2000 2000 +0.0%");
+        assert_eq!(line("seal p99"), "seal p99 90.00 ms 90.00 ms +0.0%");
         assert_eq!(
             line("runs_newest_50 p50"),
             "runs_newest_50 p50 80.0 µs 60.0 µs -25.0%"

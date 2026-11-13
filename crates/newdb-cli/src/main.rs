@@ -6,7 +6,11 @@
 //! newdb inspect --data <dir>
 //! newdb verify  --data <dir>
 //! newdb rebuild --data <dir> [--layout <name>]
-//! newdb bench   [--data <dir> | --memory] [--no-fsync] [--no-seal] [--traces N] [--batch N] [--iterations N] [--out report.json]
+//! newdb bench   [--data <dir> | --memory] [--no-fsync] [--no-seal] [--preset forge]
+//!               [--traces N] [--projects N] [--max-spans-per-trace N] [--max-depth N]
+//!               [--max-fanout N] [--payload-median BYTES]
+//!               [--target-trace-spans N [--target-traces K]] [--seal-every POSTS]
+//!               [--batch N] [--iterations N] [--out report.json]
 //! newdb bench   --compare a.json b.json
 //! ```
 //! `--memory` runs against `newdb_testkit::Oracle`, so every command except the engine-only
@@ -14,8 +18,16 @@
 //!
 //! `bench --data` seals the active partition after the ingest, so the timed reads walk
 //! sealed, memory-mapped layout files as most reads do; `--no-seal` times the in-memory
-//! active partition instead. Use a fresh directory: the workload is ingested on top of
-//! whatever is there.
+//! active partition instead. `--seal-every N` seals after every N posts during the ingest
+//! and leaves the rest in the active partition, so the reads cover many sealed partitions
+//! plus the active one. Use a fresh directory: the workload is ingested on top of whatever
+//! is there. The report adds the partition count and the data directory's size.
+//!
+//! The workload flags set `newdb_testkit::r#gen::GenConfig`. `--target-trace-spans N` adds
+//! `--target-traces` (default 3) traces of exactly N spans, and the `trace_largest_*` reads
+//! load the first of them. `--preset forge` is the Forge/xitdb comparison (about 1.2M posts,
+//! 2 KB median payloads, 20 traces of exactly 2,000 spans, sealing every 100k posts); flags
+//! given with it override its values. It needs `--data`.
 //!
 //! `inspect` and `verify` open the directory read-only, so they work next to a running
 //! `serve`. `rebuild` needs the writer.
@@ -29,6 +41,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -47,7 +60,11 @@ const USAGE: &str = "usage:
   newdb inspect --data <dir>
   newdb verify  --data <dir>
   newdb rebuild --data <dir> [--layout <name>]
-  newdb bench   (--data <dir> | --memory) [--no-fsync] [--no-seal] [--traces N] [--batch N] [--iterations N] [--out report.json]
+  newdb bench   (--data <dir> | --memory) [--no-fsync] [--no-seal] [--preset forge]
+                [--traces N] [--projects N] [--max-spans-per-trace N] [--max-depth N]
+                [--max-fanout N] [--payload-median BYTES]
+                [--target-trace-spans N [--target-traces K]] [--seal-every POSTS]
+                [--batch N] [--iterations N] [--out report.json]
   newdb bench   --compare a.json b.json";
 
 /// What went wrong: bad arguments (exit 2) or a failed command (exit 1).
@@ -92,7 +109,22 @@ fn run(args: &[String]) -> Result<ExitCode, Fail> {
         "rebuild" => rebuild(&Args::parse(rest, &["data", "layout"], &[])?),
         "bench" => bench(&Args::parse(
             rest,
-            &["data", "traces", "batch", "iterations", "out"],
+            &[
+                "data",
+                "preset",
+                "traces",
+                "projects",
+                "max-spans-per-trace",
+                "max-depth",
+                "max-fanout",
+                "payload-median",
+                "target-trace-spans",
+                "target-traces",
+                "seal-every",
+                "batch",
+                "iterations",
+                "out",
+            ],
             &["no-fsync", "no-seal", "memory", "compare"],
         )?),
         "help" | "-h" | "--help" => {
@@ -153,7 +185,7 @@ impl Args {
         self.switches.iter().any(|s| s == name)
     }
 
-    fn number(&self, name: &str) -> Result<Option<usize>, Fail> {
+    fn number<T: std::str::FromStr>(&self, name: &str) -> Result<Option<T>, Fail> {
         self.get(name)
             .map(|v| {
                 v.parse()
@@ -323,25 +355,48 @@ fn bench(a: &Args) -> Result<ExitCode, Fail> {
         return Ok(ExitCode::SUCCESS);
     }
     a.no_positional()?;
-    let mut config = BenchConfig::default();
-    if let Some(n) = a.number("traces")? {
-        config.workload.traces = n;
+    let mut config = match a.get("preset") {
+        None => BenchConfig::default(),
+        Some(p) => BenchConfig::preset(p)
+            .ok_or_else(|| Fail::Usage(format!("unknown preset {p:?} (expected forge)")))?,
+    };
+    let w = &mut config.workload;
+    macro_rules! set {
+        ($($flag:literal => $field:expr),* $(,)?) => {
+            $( if let Some(n) = a.number($flag)? { $field = n; } )*
+        };
     }
-    if let Some(n) = a.number("batch")? {
-        config.batch = n;
+    set! {
+        "traces" => w.traces,
+        "projects" => w.projects,
+        "max-spans-per-trace" => w.max_spans_per_trace,
+        "max-depth" => w.max_depth,
+        "max-fanout" => w.max_fanout,
+        "payload-median" => w.payload_median,
+        "target-traces" => config.target_traces,
+        "seal-every" => config.seal_every,
+        "batch" => config.batch,
+        "iterations" => config.iterations,
     }
-    if let Some(n) = a.number("iterations")? {
-        config.iterations = n;
+    if let Some(n) = a.number("target-trace-spans")? {
+        config.target_trace_spans = Some(n);
     }
     let report = match (a.get("data"), a.has("memory")) {
-        (Some(_), false) => {
+        (Some(dir), false) => {
+            config.seal_at_end = config.seal_every == 0 && !a.has("no-seal");
             let db = a.engine()?;
-            let seal = !a.has("no-seal");
-            let report = newdb_tools::run_bench_with(&db, &config, &mut || {
-                if seal { db.seal_active() } else { Ok(()) }
-            })?;
+            let mut report = newdb_tools::run_bench_with(&db, &config, &mut || db.seal_active())?;
+            report.partitions = Some(db.partitions()?.len() as u64);
             db.close()?;
+            report.bytes_on_disk = Some(
+                dir_size(Path::new(dir)).map_err(|e| Fail::Run(format!("sizing {dir}: {e}")))?,
+            );
             report
+        }
+        _ if config.seal_every > 0 => {
+            return Err(Fail::Usage(
+                "--seal-every and --preset forge need --data <dir>".into(),
+            ));
         }
         _ => newdb_tools::run_bench(a.store()?.as_ref(), &config)?,
     };
@@ -351,4 +406,19 @@ fn bench(a: &Args) -> Result<ExitCode, Fail> {
     }
     print!("{json}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// Bytes of every file under `dir`, not following symlinks.
+fn dir_size(dir: &Path) -> std::io::Result<u64> {
+    let mut total = 0;
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        let m = e.metadata()?;
+        total += if m.is_dir() {
+            dir_size(&e.path())?
+        } else {
+            m.len()
+        };
+    }
+    Ok(total)
 }
