@@ -413,8 +413,13 @@ impl Db {
     }
 
     /// Seals the active partition now, as if its hour had ended. For tests and tools.
+    /// Unlike the hourly seal, also waits for the partition's payloads to be re-framed
+    /// (and any re-framing queued before), so reads afterwards see the steady state; the
+    /// writer keeps taking ingests meanwhile.
     pub fn seal_active(&self) -> Result<()> {
-        self.call(Msg::Seal)
+        self.call(Msg::Seal)?;
+        self.inner.reframe.wait_idle();
+        Ok(())
     }
 
     /// Applies retention now instead of waiting for the next hourly check.

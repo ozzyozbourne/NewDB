@@ -5,10 +5,16 @@
 //! [`each`] queues tasks, runs the first on the calling thread, then runs queued tasks
 //! (its own or another caller's) until its own are done. With no worker threads (one core)
 //! the caller runs every task itself.
+//!
+//! Waking a sleeping thread can take longer than a task on virtual machines, so for a
+//! while after [`wake`] (a caller that will soon queue large work), and briefly after
+//! each batch of tasks, idle workers poll the queue instead of sleeping.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::part::cores;
 
@@ -17,14 +23,57 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 struct Queue {
     jobs: Mutex<VecDeque<Job>>,
     ready: Condvar,
+    /// `jobs.len()`, read without the lock while polling.
+    queued: AtomicUsize,
+    /// Until when idle workers poll, in nanoseconds since `start`.
+    hot_until: AtomicU64,
+    start: Instant,
 }
+
+/// How long idle workers poll after [`wake`], and after a batch of tasks is queued.
+const WAKE_POLL: Duration = Duration::from_millis(2);
+const BATCH_POLL: Duration = Duration::from_micros(200);
 
 impl Queue {
     fn pop(&self) -> Option<Job> {
-        self.jobs
+        let job = self
+            .jobs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .pop_front()
+            .pop_front();
+        if job.is_some() {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
+        }
+        job
+    }
+
+    fn now(&self) -> u64 {
+        self.start.elapsed().as_nanos() as u64
+    }
+
+    fn hot(&self) -> bool {
+        self.now() < self.hot_until.load(Ordering::Relaxed)
+    }
+
+    fn heat(&self, d: Duration) {
+        let until = self.now() + d.as_nanos() as u64;
+        self.hot_until.fetch_max(until, Ordering::Relaxed);
+    }
+
+    /// A worker's next job: polls while hot, sleeps otherwise.
+    fn next(&self) -> Job {
+        loop {
+            if let Some(j) = self.pop() {
+                return j;
+            }
+            while self.queued.load(Ordering::Relaxed) == 0 && self.hot() {
+                std::thread::yield_now();
+            }
+            let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            while jobs.is_empty() && !self.hot() {
+                jobs = self.ready.wait(jobs).unwrap_or_else(|e| e.into_inner());
+            }
+        }
     }
 }
 
@@ -70,30 +119,31 @@ pub(crate) fn workers() -> usize {
     cores().clamp(1, 8) - 1
 }
 
+/// Tells idle workers that large work is coming soon, so they are awake when it does.
+pub(crate) fn wake() {
+    if workers() > 0 {
+        let q = queue();
+        q.heat(WAKE_POLL);
+        q.ready.notify_all();
+    }
+}
+
 fn queue() -> &'static Queue {
     static QUEUE: OnceLock<&'static Queue> = OnceLock::new();
     QUEUE.get_or_init(|| {
         let q: &'static Queue = Box::leak(Box::new(Queue {
             jobs: Mutex::new(VecDeque::new()),
             ready: Condvar::new(),
+            queued: AtomicUsize::new(0),
+            hot_until: AtomicU64::new(0),
+            start: Instant::now(),
         }));
         for i in 0..workers() {
             let _ = std::thread::Builder::new()
                 .name(format!("newdb-read-{}", i + 1))
                 .spawn(move || {
                     loop {
-                        let job = {
-                            let mut jobs = q.jobs.lock().unwrap_or_else(|e| e.into_inner());
-                            loop {
-                                match jobs.pop_front() {
-                                    Some(j) => break j,
-                                    None => {
-                                        jobs = q.ready.wait(jobs).unwrap_or_else(|e| e.into_inner())
-                                    }
-                                }
-                            }
-                        };
-                        job();
+                        q.next()();
                     }
                 });
         }
@@ -131,6 +181,8 @@ pub(crate) fn each<T: Send>(n: usize, f: &(dyn Fn(usize) -> T + Sync)) -> Vec<Op
                     latch.count_down();
                 }));
             }
+            q.queued.fetch_add(n - 1, Ordering::Relaxed);
+            q.heat(BATCH_POLL);
         }
         q.ready.notify_all();
         run(0);

@@ -781,7 +781,6 @@ fn sealed_payloads_replace_the_blob_through_crashes() {
     let blob = std::fs::read(a.path().join(&active).join(PAYLOADS)).unwrap();
     let d = Driver::new(a.path(), 0, 0, 0);
     d.with(|db| db.seal_active()).unwrap();
-    d.with(|db| db.inner.reframe.wait_idle());
     let reference = std::fs::read(a.path().join(&active).join(SEALED_PAYLOADS)).unwrap();
     std::fs::write(a.path().join(&active).join(PAYLOADS), &blob).unwrap();
     d.reopen(true);
@@ -813,7 +812,6 @@ fn sealed_payloads_replace_the_blob_through_crashes() {
     assert!(!p.sealed && p.payload_bytes == blob_len);
     assert!(db_b.with(|db| db.inspect()).is_ok());
     db_b.with(|db| db.seal_active()).unwrap();
-    db_b.with(|db| db.inner.reframe.wait_idle());
     assert!(sealed_ok(b.path(), &active));
     let resealed = std::fs::read(b.path().join(&active).join(SEALED_PAYLOADS)).unwrap();
     assert!(resealed == reference, "reseal wrote different bytes");

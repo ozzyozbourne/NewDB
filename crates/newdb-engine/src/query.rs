@@ -46,14 +46,22 @@ fn add_cost(st: &mut ReadStats, c: Cost) {
 }
 
 /// Every span of trace `t` (of `project`, or of all projects), merged across partitions.
+/// With `wake`, wakes the read pool once the payloads in the headers reach
+/// [`PARALLEL_PAYLOAD_BYTES`], so its threads are up when the payloads are read.
 pub(crate) fn load_trace(
     views: &[View<'_>],
     t: TraceId,
     project: Option<&str>,
+    wake: bool,
     st: &mut ReadStats,
 ) -> Result<Vec<Merged>> {
     let mut out: Vec<Merged> = Vec::new();
-    let mut index = HashMap::new();
+    let mut woken = !wake;
+    let mut raw = 0u64;
+    // (project, span) -> index in `out`, built when a second partition has the trace:
+    // within one partition every span appears once.
+    let mut index: Option<HashMap<(&str, newdb_types::SpanId), usize>> = None;
+    let mut first: Option<usize> = None;
     for (i, v) in views.iter().enumerate() {
         if !v.may_contain(t) {
             continue;
@@ -68,6 +76,38 @@ pub(crate) fn load_trace(
         let (headers, cost) = v.trace(t)?;
         st.partitions_touched += 1;
         add_cost(st, cost);
+        if headers.is_empty() {
+            continue;
+        }
+        if !woken {
+            raw += headers
+                .iter()
+                .flat_map(|h| PAYLOAD_FIELDS.map(|b| (h.has(b), payload_ref(h, b).raw_len)))
+                .filter_map(|(has, n)| has.then_some(n as u64))
+                .sum::<u64>();
+            if raw >= PARALLEL_PAYLOAD_BYTES {
+                crate::pool::wake();
+                woken = true;
+            }
+        }
+        match first {
+            None => {
+                first = Some(i);
+                out.reserve(headers.len());
+            }
+            Some(f) if index.is_none() => {
+                let mut ix = HashMap::with_capacity(out.len() + headers.len());
+                for (k, m) in out.iter().enumerate() {
+                    let p = views[f]
+                        .strings()
+                        .get(m.first.1.project)
+                        .ok_or_else(|| corrupt("project is not in the partition"))?;
+                    ix.insert((p, m.span.span_id), k);
+                }
+                index = Some(ix);
+            }
+            Some(_) => {}
+        }
         for h in headers {
             if pid.is_some_and(|id| h.project != id) {
                 continue;
@@ -78,7 +118,7 @@ pub(crate) fn load_trace(
                 .strings()
                 .get(h.project)
                 .ok_or_else(|| corrupt("project is not in the partition"))?;
-            match index.get(&(project, s.span_id)) {
+            match index.as_ref().and_then(|ix| ix.get(&(project, s.span_id))) {
                 Some(&k) => {
                     let m: &mut Merged = &mut out[k];
                     m.span.merge_from(&s);
@@ -89,7 +129,9 @@ pub(crate) fn load_trace(
                     }
                 }
                 None => {
-                    index.insert((project, s.span_id), out.len());
+                    if let Some(ix) = index.as_mut() {
+                        ix.insert((project, s.span_id), out.len());
+                    }
                     out.push(Merged {
                         span: s,
                         first: (i, h),
@@ -133,105 +175,135 @@ fn load_payloads(
 }
 
 /// Below this many raw payload bytes, a trace load decodes on the calling thread only.
-const PARALLEL_PAYLOAD_BYTES: u64 = 256 << 10;
+pub(crate) const PARALLEL_PAYLOAD_BYTES: u64 = 256 << 10;
 
-/// One payload to read for `fill_payloads`: (span, field, partition, reference).
-type Job = (usize, u32, usize, PayloadRef);
-
-/// Work for one task: one `payloads.blob` entry, or one sealed frame with every job that
-/// reads from it (and each job's place in the frame).
-struct Unit<'a> {
-    raw: u64,
-    frame: Option<(Sealed<'a>, u32)>,
-    jobs: Vec<(usize, Option<Loc>)>,
+/// The piece that sets each payload field in `mask` of `m` (the last piece that has it):
+/// `(field, partition, reference)`.
+fn payload_jobs(m: &Merged, mask: u32) -> impl Iterator<Item = (u32, usize, PayloadRef)> + '_ {
+    PAYLOAD_FIELDS.into_iter().filter_map(move |bit| {
+        if mask & bit == 0 {
+            return None;
+        }
+        let (pi, h) = m.pieces().rev().find(|(_, h)| h.has(bit))?;
+        Some((bit, *pi, payload_ref(h, bit)))
+    })
 }
 
-/// Decodes `unit` and returns its jobs' payloads in order, each in its own buffer. A
-/// frame is decompressed once and its CRC checked once; a job that is its whole frame
-/// takes the frame's buffer.
-fn read_unit(blobs: &[BlobRef<'_>], jobs: &[Job], unit: &Unit<'_>) -> Result<Vec<Vec<u8>>> {
-    let Some((s, frame)) = unit.frame else {
-        let (_, _, pi, r) = jobs[unit.jobs[0].0];
-        return Ok(vec![blobs[pi].read(r)?]);
-    };
-    let raw = s.decompress(frame as usize)?;
-    if let [(_, Some(loc))] = unit.jobs[..]
-        && loc.at == 0
-        && loc.len as usize == raw.len()
-    {
-        return Ok(vec![raw]);
-    }
-    unit.jobs
-        .iter()
-        .map(|(_, loc)| match loc {
-            Some(loc) => Ok(Sealed::get(&raw, *loc)?.to_vec()),
-            None => Err(corrupt("payload job without a frame")),
-        })
-        .collect()
-}
-
-/// Fills the payload fields in `mask` of every span. Payloads are read in units (a blob
-/// entry, or a sealed frame decompressed once for all its payloads). With enough bytes the
-/// units run on the read pool, largest first, and the calling thread takes part; slicing
-/// and copying each payload into its span's buffer happen on the same task as the
-/// decompression.
+/// Fills the payload fields in `mask` of every span. Large traces are split into
+/// contiguous runs of spans of about equal payload bytes, one task each on the read pool
+/// (the calling thread takes part); each task finds, decodes and places its own payloads.
+/// Spans are in trace order, which is the order their payloads were framed in, so a frame
+/// is decoded by one task, or by two when it straddles a run boundary.
 fn fill_payloads(
     blobs: &[BlobRef<'_>],
     merged: &mut [Merged],
     mask: u32,
     st: &mut ReadStats,
 ) -> Result<()> {
-    let mut jobs: Vec<Job> = Vec::new();
-    for (i, m) in merged.iter().enumerate() {
-        for bit in PAYLOAD_FIELDS {
-            if mask & bit != 0
-                && let Some((pi, h)) = m.pieces().rev().find(|(_, h)| h.has(bit))
-            {
-                jobs.push((i, bit, *pi, payload_ref(h, bit)));
+    let raws: Vec<u64> = merged
+        .iter()
+        .map(|m| payload_jobs(m, mask).map(|j| j.2.raw_len as u64).sum())
+        .collect();
+    let total: u64 = raws.iter().sum();
+    let threads = crate::pool::workers() + 1;
+    if total < PARALLEL_PAYLOAD_BYTES || threads == 1 || merged.len() < 2 {
+        st.payload_bytes_decompressed += fill_range(blobs, merged, mask)?;
+        return Ok(());
+    }
+    let tasks = (2 * threads).min(merged.len());
+    let mut chunks: Vec<std::sync::Mutex<&mut [Merged]>> = Vec::with_capacity(tasks);
+    let (mut rest, mut acc, mut taken) = (merged, 0u64, 0usize);
+    for (i, r) in raws.iter().enumerate() {
+        acc += r;
+        let k = chunks.len() as u64 + 1;
+        if k < tasks as u64 && acc * tasks as u64 >= total * k {
+            let (head, tail) = std::mem::take(&mut rest).split_at_mut(i + 1 - taken);
+            chunks.push(std::sync::Mutex::new(head));
+            rest = tail;
+            taken = i + 1;
+        }
+    }
+    if !rest.is_empty() {
+        chunks.push(std::sync::Mutex::new(rest));
+    }
+    let done = crate::pool::each(chunks.len(), &|k| {
+        let mut g = chunks[k].lock().unwrap_or_else(|e| e.into_inner());
+        fill_range(blobs, &mut g, mask)
+    });
+    for r in done {
+        st.payload_bytes_decompressed +=
+            r.unwrap_or_else(|| Err(corrupt("payload task panicked")))?;
+    }
+    Ok(())
+}
+
+/// Fills the payload fields in `mask` of `spans` on this thread and returns the bytes
+/// read. Sealed payloads are looked up in ascending offset order (galloping through each
+/// partition's entry table) and grouped by frame, so each frame is decompressed once,
+/// into a buffer reused across frames; a payload that is its whole frame takes the buffer.
+fn fill_range(blobs: &[BlobRef<'_>], spans: &mut [Merged], mask: u32) -> Result<u64> {
+    // (partition, offset, span, field, reference) of sealed payloads; others read now.
+    let mut lookups: Vec<(usize, u64, usize, u32, PayloadRef)> = Vec::new();
+    let mut bytes = 0u64;
+    for (i, m) in spans.iter_mut().enumerate() {
+        let mut js = [(0, 0, PayloadRef::NONE); PAYLOAD_FIELDS.len()];
+        let mut n = 0;
+        for j in payload_jobs(m, mask) {
+            js[n] = j;
+            n += 1;
+        }
+        for &(bit, pi, r) in &js[..n] {
+            match blobs[pi] {
+                BlobRef::Sealed(_) => lookups.push((pi, r.offset, i, bit, r)),
+                b => {
+                    let p = b.read(r)?;
+                    bytes += p.len() as u64;
+                    set_payload(&mut m.span, bit, p)?;
+                }
             }
         }
     }
-    let mut units: Vec<Unit<'_>> = Vec::new();
-    let mut by_frame: HashMap<(usize, u32), usize> = HashMap::new();
-    for (j, &(_, _, pi, r)) in jobs.iter().enumerate() {
-        match blobs[pi].locate(r)? {
-            None => units.push(Unit {
-                raw: r.raw_len as u64 + 64,
-                frame: None,
-                jobs: vec![(j, None)],
-            }),
-            Some((s, loc)) => match by_frame.entry((pi, loc.frame)) {
-                Entry::Occupied(e) => units[*e.get()].jobs.push((j, Some(loc))),
-                Entry::Vacant(e) => {
-                    e.insert(units.len());
-                    units.push(Unit {
-                        raw: s.frame(loc.frame as usize).raw_len as u64 + 64,
-                        frame: Some((s, loc.frame)),
-                        jobs: vec![(j, Some(loc))],
-                    });
-                }
-            },
-        }
-    }
-    let total: u64 = units.iter().map(|u| u.raw).sum();
-    let results: Vec<Result<Vec<Vec<u8>>>> =
-        if units.len() > 1 && total >= PARALLEL_PAYLOAD_BYTES && crate::pool::workers() > 0 {
-            units.sort_unstable_by_key(|u| Reverse(u.raw));
-            crate::pool::each(units.len(), &|k| read_unit(blobs, &jobs, &units[k]))
-                .into_iter()
-                .map(|r| r.unwrap_or_else(|| Err(corrupt("payload task panicked"))))
-                .collect()
-        } else {
-            units.iter().map(|u| read_unit(blobs, &jobs, u)).collect()
+    lookups.sort_unstable_by_key(|l| (l.0, l.1));
+    // (partition, frame, location, span, field), then sorted by frame.
+    let mut located: Vec<(usize, u32, Loc, usize, u32)> = Vec::with_capacity(lookups.len());
+    let mut at = (usize::MAX, 0);
+    for &(pi, offset, i, bit, r) in &lookups {
+        let BlobRef::Sealed(s) = blobs[pi] else {
+            continue;
         };
-    for (unit, payloads) in units.iter().zip(results) {
-        for (&(j, _), b) in unit.jobs.iter().zip(payloads?) {
-            let (i, bit, ..) = jobs[j];
-            st.payload_bytes_decompressed += b.len() as u64;
-            set_payload(&mut merged[i].span, bit, b)?;
+        if at.0 != pi {
+            at = (pi, 0);
+        }
+        let (next, loc) = s.find_from(at.1, offset);
+        at.1 = next;
+        match loc {
+            Some(loc) if loc.len == r.raw_len => located.push((pi, loc.frame, loc, i, bit)),
+            _ => {
+                return Err(corrupt(format!(
+                    "payloads.sealed: no payload of {} bytes for offset {offset}",
+                    r.raw_len
+                )));
+            }
         }
     }
-    Ok(())
+    located.sort_unstable_by_key(|l| (l.0, l.1, l.2.at));
+    let mut buf = Vec::new();
+    for run in located.chunk_by(|a, b| (a.0, a.1) == (b.0, b.1)) {
+        let BlobRef::Sealed(s) = blobs[run[0].0] else {
+            continue;
+        };
+        s.decompress_into(run[0].1 as usize, &mut buf)?;
+        for (k, &(_, _, loc, i, bit)) in run.iter().enumerate() {
+            let whole = loc.at == 0 && loc.len as usize == buf.len();
+            let p = match whole && k + 1 == run.len() {
+                true => std::mem::take(&mut buf),
+                false => Sealed::get(&buf, loc)?.to_vec(),
+            };
+            bytes += p.len() as u64;
+            set_payload(&mut spans[i].span, bit, p)?;
+        }
+    }
+    Ok(bytes)
 }
 
 struct Phases {
@@ -267,7 +339,7 @@ fn done<T>(value: Vec<T>, mut stats: ReadStats, phases: Phases) -> Read<Vec<T>> 
 pub(crate) fn trace(views: &[View<'_>], q: &TraceQuery) -> Result<Read<Vec<Span>>> {
     let mut ph = Phases::new(q.timings);
     let mut st = ReadStats::default();
-    let mut merged = load_trace(views, q.trace_id, Some(&q.project), &mut st)?;
+    let mut merged = load_trace(views, q.trace_id, Some(&q.project), q.payloads, &mut st)?;
     ph.mark("headers");
     let mask = if q.payloads { ALL_PAYLOADS } else { ERROR };
     let blobs: Vec<BlobRef<'_>> = views.iter().map(|v| v.blob()).collect();
@@ -341,7 +413,7 @@ pub(crate) fn runs(
                 .get(s.project)
                 .ok_or_else(|| corrupt("run summary project is not in the partition"))?;
             if let Entry::Vacant(e) = cache.entry(s.trace_id) {
-                e.insert(load_trace(views, s.trace_id, None, &mut st)?);
+                e.insert(load_trace(views, s.trace_id, None, false, &mut st)?);
             }
             let m = cache[&s.trace_id]
                 .iter()
@@ -446,7 +518,7 @@ pub(crate) fn search(
     let mut traces: Vec<TraceId> = multi.iter().copied().collect();
     traces.sort_unstable();
     for t in traces {
-        for m in load_trace(views, t, q.project.as_deref(), &mut st)? {
+        for m in load_trace(views, t, q.project.as_deref(), false, &mut st)? {
             if m.pieces().any(|(_, h)| h.has(INPUTS) || h.has(OUTPUTS)) {
                 let key = RunKey {
                     start_ns: m.span.start_ns.unwrap_or(0),

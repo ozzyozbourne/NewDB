@@ -21,11 +21,14 @@ use crate::part::{Blob, Body, Part, reopen_sealed, write_sealed_payloads};
 #[derive(Default)]
 struct State {
     ids: VecDeque<u64>,
+    /// Partitions ever queued, and those the thread has finished with (or given up on).
+    pushed: u64,
+    finished: u64,
     busy: bool,
     stop: bool,
 }
 
-/// Partition IDs waiting to be re-framed.
+/// Partition IDs waiting to be re-framed, in order.
 #[derive(Default)]
 pub(crate) struct Queue {
     state: Mutex<State>,
@@ -38,7 +41,9 @@ impl Queue {
     }
 
     pub fn push(&self, id: u64) {
-        self.lock().ids.push_back(id);
+        let mut s = self.lock();
+        s.ids.push_back(id);
+        s.pushed += 1;
         self.cv.notify_all();
     }
 
@@ -54,8 +59,11 @@ impl Queue {
 
     fn next(&self) -> Option<u64> {
         let mut s = self.lock();
-        s.busy = false;
-        self.cv.notify_all();
+        if s.busy {
+            s.busy = false;
+            s.finished += 1;
+            self.cv.notify_all();
+        }
         loop {
             if s.stop {
                 return None;
@@ -68,11 +76,11 @@ impl Queue {
         }
     }
 
-    /// Waits until every queued partition is re-framed (or the thread stopped).
-    #[cfg(test)]
+    /// Waits until every partition queued so far is re-framed (or the thread stopped).
     pub fn wait_idle(&self) {
         let mut s = self.lock();
-        while !s.stop && (s.busy || !s.ids.is_empty()) {
+        let target = s.pushed;
+        while !s.stop && s.finished < target {
             s = self.cv.wait(s).unwrap_or_else(|e| e.into_inner());
         }
     }

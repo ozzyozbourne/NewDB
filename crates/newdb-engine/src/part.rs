@@ -902,14 +902,17 @@ pub(crate) fn plan_sealed(spans: &[SpanHeader], all: &[PayloadRef], target: usiz
         }
     };
     let traces = || spans.chunk_by(|a, b| a.trace_id == b.trace_id);
+    // Traces using each payload of `all`, by position; 0 once a trace has claimed it.
+    let pos = |r: &PayloadRef| all.binary_search_by_key(&r.offset, |a| a.offset).ok();
     let mut refs = Vec::new();
-    let mut uses: HashMap<u64, u32> = HashMap::with_capacity(all.len());
+    let mut uses = vec![0u32; all.len()];
     for trace in traces() {
         refs_of(trace, &mut refs);
-        for r in &refs {
-            *uses.entry(r.offset).or_default() += 1;
+        for k in refs.iter().filter_map(pos) {
+            uses[k] += 1;
         }
     }
+    let used: Vec<bool> = uses.iter().map(|&n| n > 0).collect();
     let mut plan = sealed::Plan::new(target);
     let mut shared = Vec::new();
     let mut own = Vec::new();
@@ -917,9 +920,10 @@ pub(crate) fn plan_sealed(spans: &[SpanHeader], all: &[PayloadRef], target: usiz
         refs_of(trace, &mut refs);
         own.clear();
         for r in &refs {
-            match uses.get_mut(&r.offset) {
-                Some(1) => own.push(*r),
-                // The first trace using a shared payload claims it; 0 marks it claimed.
+            match pos(r).map(|k| &mut uses[k]) {
+                // Not in the log: cannot happen, as every header comes from logged posts.
+                None | Some(1) => own.push(*r),
+                // The first trace using a shared payload claims it.
                 Some(n) if *n > 1 => {
                     *n = 0;
                     shared.push(*r);
@@ -931,8 +935,8 @@ pub(crate) fn plan_sealed(spans: &[SpanHeader], all: &[PayloadRef], target: usiz
         own.iter().for_each(|r| plan.add(*r));
     }
     shared.into_iter().for_each(|r| plan.add_alone(r));
-    for r in all {
-        if !uses.contains_key(&r.offset) {
+    for (r, used) in all.iter().zip(used) {
+        if !used {
             plan.add(*r);
         }
     }
@@ -942,19 +946,30 @@ pub(crate) fn plan_sealed(spans: &[SpanHeader], all: &[PayloadRef], target: usiz
 /// Every payload a partition's log refers to, sorted by offset, unique.
 fn log_payloads(dir: &Path) -> Result<Vec<PayloadRef>> {
     let bytes = files::map(&dir.join(LOG))?;
-    let mut out = Vec::new();
+    // Payloads are appended in log order, so a new one has the highest offset yet; a
+    // lower offset is a deduplicated reference to an earlier one (kept aside, merged).
+    let (mut out, mut late): (Vec<PayloadRef>, Vec<PayloadRef>) = (Vec::new(), Vec::new());
     for rec in log::Reader::new(&bytes)? {
         if rec.kind == log::kind::SPAN_POST {
             let h = rec.post()?;
             for bit in PAYLOAD_FIELDS {
                 if h.has(bit) {
-                    out.push(payload_ref(&h, bit));
+                    let r = payload_ref(&h, bit);
+                    match out.last() {
+                        Some(l) if l.offset >= r.offset => late.push(r),
+                        _ => out.push(r),
+                    }
                 }
             }
         }
     }
-    out.sort_unstable_by_key(|r| r.offset);
-    out.dedup_by_key(|r| r.offset);
+    late.sort_unstable_by_key(|r| r.offset);
+    late.dedup_by_key(|r| r.offset);
+    late.retain(|r| out.binary_search_by_key(&r.offset, |o| o.offset).is_err());
+    if !late.is_empty() {
+        out.extend(late);
+        out.sort_unstable_by_key(|r| r.offset);
+    }
     Ok(out)
 }
 
@@ -1027,7 +1042,15 @@ fn payload_files(dir: &Path) -> Result<(Option<Bytes>, Bytes)> {
 fn open_payloads(dir: &Path) -> Result<Blob> {
     match payload_files(dir)? {
         (Some(b), _) => {
-            let layout = sealed::Sealed::open(&b)?.layout();
+            // Validate the tables from a plain read: validating through the mapping
+            // would keep all of them resident (megabytes per partition) for good.
+            let f = File::open(dir.join(SEALED_PAYLOADS))?;
+            let mut head = vec![0; sealed::HEADER_LEN.min(b.len())];
+            f.read_exact_at(&mut head, 0)?;
+            let end = sealed::Sealed::tables_end(&head)?.min(b.len());
+            let mut prefix = vec![0; end];
+            f.read_exact_at(&mut prefix, 0)?;
+            let layout = sealed::Sealed::check_tables(&prefix, b.len() as u64)?;
             Ok(Blob::Sealed(b, layout))
         }
         (None, blob) => {

@@ -24,12 +24,15 @@ use std::io::{Seek, SeekFrom, Write};
 
 use newdb_types::{PayloadRef, Result};
 
-use crate::payload::{codec, compress, decompress};
+use crate::payload::{codec, compress, decompress_into};
 use crate::{FILE_HEADER_LEN, MAGIC_SEALED, check_file_header, corrupt, file_header};
 
 const FRAME_LEN: usize = 24;
 const ENTRY_LEN: usize = 24;
 const TABLES_AT: usize = FILE_HEADER_LEN + 16;
+
+/// Bytes of the file header, before the tables.
+pub const HEADER_LEN: usize = TABLES_AT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frame {
@@ -249,11 +252,15 @@ pub fn write<W: Write + Seek>(
 }
 
 fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    let mut v = [0; 4];
+    v.copy_from_slice(&b[at..at + 4]);
+    u32::from_le_bytes(v)
 }
 
 fn le64(b: &[u8], at: usize) -> u64 {
-    u64::from(le32(b, at)) | (u64::from(le32(b, at + 4)) << 32)
+    let mut v = [0; 8];
+    v.copy_from_slice(&b[at..at + 8]);
+    u64::from_le_bytes(v)
 }
 
 /// A validated view of a `payloads.sealed` file.
@@ -270,62 +277,82 @@ pub struct Layout {
     frames: usize,
     entries: usize,
     data_start: usize,
+    file_len: u64,
 }
 
 impl<'a> Sealed<'a> {
     /// Checks the tables completely (CRC, order, bounds), so later lookups cannot fail on
     /// structure; frame data is checked when read ([`Sealed::verify`] checks all of it).
     pub fn open(bytes: &'a [u8]) -> Result<Sealed<'a>> {
-        let extra = check_file_header(bytes, MAGIC_SEALED, "payloads.sealed")?;
-        if bytes.len() < TABLES_AT {
+        let layout = Sealed::check_tables(bytes, bytes.len() as u64)?;
+        Ok(Sealed { bytes, layout })
+    }
+
+    /// Where the frame data starts (the length of the header and tables) of a file whose
+    /// first [`HEADER_LEN`] bytes are `head`.
+    pub fn tables_end(head: &[u8]) -> Result<usize> {
+        let extra = check_file_header(head, MAGIC_SEALED, "payloads.sealed")?;
+        if head.len() < TABLES_AT {
             return Err(corrupt("payloads.sealed: truncated"));
         }
-        if extra != 0 || le32(bytes, FILE_HEADER_LEN + 12) != 0 {
+        if extra != 0 || le32(head, FILE_HEADER_LEN + 12) != 0 {
             return Err(corrupt("payloads.sealed: reserved fields set"));
         }
         let (frames, entries) = (
-            le32(bytes, FILE_HEADER_LEN) as usize,
-            le32(bytes, FILE_HEADER_LEN + 4) as usize,
+            le32(head, FILE_HEADER_LEN) as usize,
+            le32(head, FILE_HEADER_LEN + 4) as usize,
         );
-        let data_start = frames
+        frames
             .checked_mul(FRAME_LEN)
             .and_then(|f| f.checked_add(entries.checked_mul(ENTRY_LEN)?))
             .and_then(|t| t.checked_add(TABLES_AT))
-            .filter(|&d| d <= bytes.len())
-            .ok_or_else(|| corrupt("payloads.sealed: truncated tables"))?;
-        if crc32c::crc32c(&bytes[TABLES_AT..data_start]) != le32(bytes, FILE_HEADER_LEN + 8) {
+            .ok_or_else(|| corrupt("payloads.sealed: truncated tables"))
+    }
+
+    /// Validates a file of `file_len` bytes from its first bytes `prefix`, which must hold
+    /// the header and tables ([`Sealed::tables_end`] bytes); the frame data is not needed.
+    /// The engine reads this prefix with a plain read, so validating does not keep the
+    /// tables resident in a mapping. The layout is for [`Sealed::with_layout`].
+    pub fn check_tables(prefix: &[u8], file_len: u64) -> Result<Layout> {
+        let data_start = Sealed::tables_end(prefix)?;
+        if data_start > prefix.len() || data_start as u64 > file_len {
+            return Err(corrupt("payloads.sealed: truncated tables"));
+        }
+        if crc32c::crc32c(&prefix[TABLES_AT..data_start]) != le32(prefix, FILE_HEADER_LEN + 8) {
             return Err(corrupt("payloads.sealed: bad table CRC"));
         }
+        let layout = Layout {
+            frames: le32(prefix, FILE_HEADER_LEN) as usize,
+            entries: le32(prefix, FILE_HEADER_LEN + 4) as usize,
+            data_start,
+            file_len,
+        };
         let s = Sealed {
-            bytes,
-            layout: Layout {
-                frames,
-                entries,
-                data_start,
-            },
+            bytes: prefix,
+            layout,
         };
         let mut next = 0u64;
-        for i in 0..frames {
+        for i in 0..layout.frames {
             let f = s.frame(i);
             if f.offset != next || f.codec > codec::ZSTD as u32 {
                 return Err(corrupt("payloads.sealed: bad frame table"));
             }
             next += f.len as u64;
         }
-        if data_start as u64 + next != bytes.len() as u64 {
+        if data_start as u64 + next != file_len {
             return Err(corrupt("payloads.sealed: frame data length"));
         }
         let mut last = None;
-        for i in 0..entries {
+        for i in 0..layout.entries {
             let (off, l) = s.entry(i);
-            let fits = (l.frame as usize) < frames
+            let fits = (l.frame as usize) < layout.frames
                 && l.at as u64 + l.len as u64 <= s.frame(l.frame as usize).raw_len as u64;
             if !fits || last.is_some_and(|p| p >= off) {
                 return Err(corrupt("payloads.sealed: bad entry table"));
             }
             last = Some(off);
         }
-        Ok(s)
+        Ok(layout)
     }
 
     pub fn layout(&self) -> Layout {
@@ -335,7 +362,8 @@ impl<'a> Sealed<'a> {
     /// Views `bytes` with the layout [`Sealed::open`] returned for exactly these bytes.
     /// Other bytes are an error.
     pub fn with_layout(bytes: &'a [u8], layout: Layout) -> Result<Sealed<'a>> {
-        if bytes.len() < layout.data_start
+        if bytes.len() as u64 != layout.file_len
+            || bytes.len() < layout.data_start
             || le32(bytes, FILE_HEADER_LEN) as usize != layout.frames
             || le32(bytes, FILE_HEADER_LEN + 4) as usize != layout.entries
         {
@@ -381,9 +409,26 @@ impl<'a> Sealed<'a> {
     /// Where the payload stored at `blob_offset` in `payloads.blob` lives: a binary
     /// search over the entries' offsets.
     pub fn find(&self, blob_offset: u64) -> Option<Loc> {
+        self.find_from(0, blob_offset).1
+    }
+
+    /// [`Sealed::find`] searching only entries from index `from`, which must not be past
+    /// the entry for `blob_offset`. Returns where the search ended, to pass as `from` for
+    /// the next larger offset: looking up offsets in ascending order this way gallops
+    /// forward instead of searching the whole table each time.
+    pub fn find_from(&self, from: usize, blob_offset: u64) -> (usize, Option<Loc>) {
         let base = TABLES_AT + self.layout.frames * FRAME_LEN;
         let off = |i: usize| le64(self.bytes, base + i * ENTRY_LEN);
-        let (mut lo, mut hi) = (0, self.layout.entries);
+        let n = self.layout.entries;
+        let mut lo = from.min(n);
+        let mut step = 1;
+        let mut hi = lo;
+        while hi < n && off(hi) < blob_offset {
+            lo = hi + 1;
+            hi = (hi + step).min(n);
+            step *= 2;
+        }
+        let mut hi = (hi + 1).min(n);
         while lo < hi {
             let mid = (lo + hi) / 2;
             if off(mid) < blob_offset {
@@ -392,7 +437,10 @@ impl<'a> Sealed<'a> {
                 hi = mid;
             }
         }
-        (lo < self.layout.entries && off(lo) == blob_offset).then(|| self.entry(lo).1)
+        (
+            lo,
+            (lo < n && off(lo) == blob_offset).then(|| self.entry(lo).1),
+        )
     }
 
     fn frame_data(&self, f: &Frame) -> &'a [u8] {
@@ -402,23 +450,31 @@ impl<'a> Sealed<'a> {
 
     /// The raw bytes of frame `i`, after checking the CRC of its stored bytes.
     pub fn decompress(&self, i: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.decompress_into(i, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Sealed::decompress`] into `out`, replacing its contents and reusing its capacity.
+    pub fn decompress_into(&self, i: usize, out: &mut Vec<u8>) -> Result<()> {
         let f = self.frame(i);
         let data = self.frame_data(&f);
         if crc32c::crc32c(data) != f.crc {
             return Err(corrupt(format!("payloads.sealed: frame {i}: bad CRC")));
         }
+        out.clear();
         if f.codec == codec::RAW as u32 {
             if data.len() != f.raw_len as usize {
                 return Err(corrupt("payloads.sealed: raw frame length"));
             }
-            return Ok(data.to_vec());
+            out.extend_from_slice(data);
+            return Ok(());
         }
-        let out = decompress(data, f.raw_len as usize)
-            .map_err(|e| corrupt(format!("payloads.sealed: zstd: {e}")))?;
-        if out.len() != f.raw_len as usize {
-            return Err(corrupt("payloads.sealed: decompressed frame length"));
-        }
-        Ok(out)
+        out.resize(f.raw_len as usize, 0);
+        decompress_into(data, out).map_err(|e| {
+            out.clear();
+            corrupt(format!("payloads.sealed: zstd: {e}"))
+        })
     }
 
     /// The payload at `loc` within its frame's raw bytes. The frame's CRC was checked when
@@ -535,6 +591,16 @@ mod tests {
         for missing in [0, 6, 8, 999, 1001, u64::MAX] {
             assert!(s.find(missing).is_none() && s.read(missing).is_err());
         }
+        // Ascending lookups from the previous position find the same entries.
+        let mut offsets: Vec<u64> = payloads.iter().map(|p| p.0).chain([6, 999, 2000]).collect();
+        offsets.sort();
+        let mut at = 0;
+        for o in offsets {
+            let (next, loc) = s.find_from(at, o);
+            assert_eq!(loc, s.find(o), "offset {o}");
+            assert!(next >= at);
+            at = next;
+        }
         s.verify().unwrap();
         // A group that fits in a frame is not split: payloads 1000..=960 share a frame.
         let f = s.find(1000).unwrap().frame;
@@ -567,6 +633,13 @@ mod tests {
     #[test]
     fn damage_is_an_error_not_a_panic() {
         let (file, payloads) = sample(false);
+        // Validating from just the header and tables gives the same layout.
+        let end = Sealed::tables_end(&file[..HEADER_LEN]).unwrap();
+        let l = Sealed::check_tables(&file[..end], file.len() as u64).unwrap();
+        assert!(Sealed::with_layout(&file, l).is_ok());
+        assert!(Sealed::with_layout(&file[..file.len() - 1], l).is_err());
+        assert!(Sealed::check_tables(&file[..end - 1], file.len() as u64).is_err());
+        assert!(Sealed::check_tables(&file[..end], file.len() as u64 + 1).is_err());
         let tables_end = Sealed::open(&file).unwrap().layout.data_start;
         for cut in 0..file.len() {
             assert!(Sealed::open(&file[..cut]).is_err(), "cut {cut}");
