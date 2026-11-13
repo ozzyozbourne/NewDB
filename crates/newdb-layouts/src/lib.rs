@@ -27,6 +27,7 @@
 
 mod file;
 pub mod fts;
+mod fx;
 pub mod runs_by_time;
 pub mod trace_clustered;
 pub mod trace_filter;
