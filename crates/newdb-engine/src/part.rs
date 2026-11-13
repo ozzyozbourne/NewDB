@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 
 use newdb_format::manifest::PartitionEntry;
-use newdb_format::{log, overlap, payload, strings as strtbl};
+use newdb_format::{log, overlap, payload, sealed, strings as strtbl};
 use newdb_layouts::{
     Batch, Cost, FileSet, LAYOUTS, LayoutBuilder, LayoutDef, LayoutFiles, fts, runs_by_time,
     trace_clustered, trace_filter,
@@ -21,7 +21,9 @@ use newdb_types::{
     TraceId,
 };
 
-use crate::files::{self, Bytes, LAYOUTS_DIR, LOG, OVERLAP, PAYLOADS, STRINGS, layout_dir_name};
+use crate::files::{
+    self, Bytes, LAYOUTS_DIR, LOG, OVERLAP, PAYLOADS, SEALED_PAYLOADS, STRINGS, layout_dir_name,
+};
 
 pub(crate) fn corrupt(msg: impl Into<String>) -> Error {
     Error::Corrupt(msg.into())
@@ -232,6 +234,8 @@ impl Layouts {
 /// Where a partition's payload bytes are read from.
 pub(crate) enum Blob {
     Map(Bytes),
+    /// A sealed partition's `payloads.sealed`, validated when opened.
+    Sealed(Bytes, sealed::Layout),
     /// The active partition's file, of which the first `len` bytes are committed.
     File {
         file: File,
@@ -243,6 +247,7 @@ pub(crate) enum Blob {
 pub(crate) enum BlobRef<'a> {
     Slice(&'a [u8]),
     File(&'a File, u64),
+    Sealed(sealed::Sealed<'a>),
 }
 
 impl Blob {
@@ -250,14 +255,42 @@ impl Blob {
         match self {
             Blob::Map(b) => BlobRef::Slice(b),
             Blob::File { file, len } => BlobRef::File(file, *len),
+            // The layout came from opening these same immutable bytes.
+            Blob::Sealed(b, l) => match sealed::Sealed::with_layout(b, *l) {
+                Ok(s) => BlobRef::Sealed(s),
+                Err(_) => BlobRef::Slice(&[]),
+            },
         }
     }
 }
 
-impl BlobRef<'_> {
+impl<'a> BlobRef<'a> {
+    /// Where `r` lives in a sealed partition's frames; `None` for other partitions.
+    pub fn locate(&self, r: PayloadRef) -> Result<Option<(sealed::Sealed<'a>, sealed::Loc)>> {
+        let BlobRef::Sealed(s) = *self else {
+            return Ok(None);
+        };
+        match s.find(r.offset) {
+            Some(loc) if loc.len == r.raw_len => Ok(Some((s, loc))),
+            _ => Err(corrupt(format!(
+                "payloads.sealed: no payload of {} bytes for offset {}",
+                r.raw_len, r.offset
+            ))),
+        }
+    }
+
+    /// Reads one payload. On a sealed partition this decompresses its whole frame; reads
+    /// of many payloads go through `query::Frames` or `fill_payloads`, which share frames.
     pub fn read(&self, r: PayloadRef) -> Result<Vec<u8>> {
         match *self {
             BlobRef::Slice(b) => payload::read(b, r),
+            BlobRef::Sealed(s) => match self.locate(r)? {
+                Some((_, loc)) => {
+                    let raw = s.decompress(loc.frame as usize)?;
+                    Ok(sealed::Sealed::slice(&raw, loc)?.to_vec())
+                }
+                None => Err(corrupt("payloads.sealed: lookup")),
+            },
             BlobRef::File(f, len) => {
                 let range = payload::entry_range(r, len)?;
                 let mut buf = vec![0u8; range.len()];
@@ -730,11 +763,73 @@ pub(crate) fn replay(dir: &Path, mode: Mode, sink: &mut dyn FnMut(&Batch<'_>)) -
     Ok(rep)
 }
 
+/// Builds `payloads.sealed` for a partition from its `payloads.blob` and its merged
+/// headers in `trace_clustered` order (`spans`): the payloads that queries read, trace by
+/// trace, then every other entry of the blob (payloads a later post in the partition
+/// replaced, which replaying the log still reads) in blob order. Deterministic.
+pub(crate) fn build_sealed_payloads(
+    spans: &[SpanHeader],
+    blob: &[u8],
+    frame_target: usize,
+) -> Result<Vec<u8>> {
+    let mut b = sealed::Builder::new(frame_target)?;
+    let mut added = HashSet::new();
+    let mut refs = Vec::new();
+    let mut rest = spans;
+    while let Some(first) = rest.first() {
+        let n = rest
+            .iter()
+            .position(|h| h.trace_id != first.trace_id)
+            .unwrap_or(rest.len());
+        let (trace, tail) = rest.split_at(n);
+        rest = tail;
+        refs.clear();
+        for h in trace {
+            for bit in PAYLOAD_FIELDS {
+                let r = payload_ref(h, bit);
+                if h.has(bit) && added.insert(r.offset) {
+                    refs.push(r);
+                }
+            }
+        }
+        b.start_group(refs.iter().map(|r| r.raw_len as usize).sum())?;
+        for r in &refs {
+            b.add(r.offset, &payload::read(blob, *r)?)?;
+        }
+    }
+    let mut scan = payload::Scan::new(blob)?;
+    for e in scan.by_ref() {
+        if added.insert(e.r.offset) {
+            b.add(e.r.offset, &payload::read(blob, e.r)?)?;
+        }
+    }
+    if scan.torn() {
+        return Err(corrupt("payloads.blob is torn"));
+    }
+    b.finish()
+}
+
+/// A sealed partition's payloads: `payloads.sealed` once sealing has written it, else
+/// `payloads.blob`.
+fn open_payloads(dir: &Path) -> Result<Blob> {
+    match files::map(&dir.join(SEALED_PAYLOADS)) {
+        Ok(b) => {
+            let layout = sealed::Sealed::open(&b)?.layout();
+            Ok(Blob::Sealed(b, layout))
+        }
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            let blob = files::map(&dir.join(PAYLOADS))?;
+            payload::check_header(&blob)?;
+            Ok(Blob::Map(blob))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Opens a sealed partition listed in MANIFEST.
 pub(crate) fn open_sealed(dir: &Path, e: &PartitionEntry) -> Result<Fixed> {
     let strings = Strings::load(&files::map(&dir.join(STRINGS))?)?;
-    let blob = files::map(&dir.join(PAYLOADS))?;
-    payload::check_header(&blob)?;
+    let blob = open_payloads(dir)?;
     let mut sets: FileSets = Vec::new();
     for def in LAYOUTS {
         if !e
@@ -770,7 +865,7 @@ pub(crate) fn open_sealed(dir: &Path, e: &PartitionEntry) -> Result<Fixed> {
     };
     Ok(Fixed {
         strings,
-        blob: Blob::Map(blob),
+        blob,
         stats: Stats::from_entry(e),
         layouts,
         versions: e.layouts.clone(),

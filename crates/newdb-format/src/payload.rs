@@ -169,7 +169,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-fn decompress(data: &[u8], capacity: usize) -> std::io::Result<Vec<u8>> {
+pub(crate) fn decompress(data: &[u8], capacity: usize) -> std::io::Result<Vec<u8>> {
     DCTX.with(|cell| {
         let mut slot = cell.borrow_mut();
         let d = match slot.as_mut() {

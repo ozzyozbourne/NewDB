@@ -7,6 +7,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::time::Instant;
 
+use newdb_format::sealed::{Loc, Sealed};
 use newdb_layouts::{Cost, fts};
 use newdb_types::header::field::{END, ERROR, INPUTS, MODEL, NAME, OUTPUTS, PARENT, SESSION};
 use newdb_types::text::tokens;
@@ -103,9 +104,53 @@ pub(crate) fn load_trace(
     Ok(out)
 }
 
+/// Payload reads of one query, one at a time. A sealed partition decompresses a whole
+/// frame to read one payload, so the query keeps the frames it decompressed (up to
+/// [`FRAME_CACHE`] bytes) for the payloads that share them: the fields of one span, and
+/// the spans of one trace.
+pub(crate) struct Payloads<'a> {
+    blobs: Vec<BlobRef<'a>>,
+    frames: HashMap<(usize, u32), Vec<u8>>,
+    cached: usize,
+}
+
+const FRAME_CACHE: usize = 16 << 20;
+
+impl<'a> Payloads<'a> {
+    pub fn new(views: &'a [View<'_>]) -> Payloads<'a> {
+        Payloads {
+            blobs: views.iter().map(|v| v.blob()).collect(),
+            frames: HashMap::new(),
+            cached: 0,
+        }
+    }
+
+    /// The payload `r` of partition `pi`.
+    pub fn read(&mut self, pi: usize, r: PayloadRef, st: &mut ReadStats) -> Result<Vec<u8>> {
+        let bytes = match self.blobs[pi].locate(r)? {
+            None => self.blobs[pi].read(r)?,
+            Some((s, loc)) => {
+                let key = (pi, loc.frame);
+                if !self.frames.contains_key(&key) {
+                    let raw = s.decompress(loc.frame as usize)?;
+                    if self.cached + raw.len() > FRAME_CACHE {
+                        self.frames.clear();
+                        self.cached = 0;
+                    }
+                    self.cached += raw.len();
+                    self.frames.insert(key, raw);
+                }
+                Sealed::slice(&self.frames[&key], loc)?.to_vec()
+            }
+        };
+        st.payload_bytes_decompressed += bytes.len() as u64;
+        Ok(bytes)
+    }
+}
+
 /// Fills the payload fields in `mask`: each comes from the last piece that set it.
 fn load_payloads(
-    blobs: &[BlobRef<'_>],
+    pay: &mut Payloads<'_>,
     m: &mut Merged,
     mask: u32,
     st: &mut ReadStats,
@@ -116,8 +161,7 @@ fn load_payloads(
         }
         let found = m.pieces().rev().find(|(_, h)| h.has(bit)).copied();
         if let Some((pi, h)) = found {
-            let bytes = blobs[pi].read(payload_ref(&h, bit))?;
-            st.payload_bytes_decompressed += bytes.len() as u64;
+            let bytes = pay.read(pi, payload_ref(&h, bit), st)?;
             set_payload(&mut m.span, bit, bytes)?;
         }
     }
@@ -127,53 +171,93 @@ fn load_payloads(
 /// Below this many payload bytes per thread, a trace load decompresses on one thread.
 const PARALLEL_PAYLOAD_BYTES: usize = 1 << 20;
 
-/// Fills the payload fields in `mask` of every span. Decompression dominates large
-/// traces, so with enough bytes the payloads are spread over threads by size, largest
-/// first onto the least loaded thread, and the calling thread takes one share.
+/// One payload to read for `fill_payloads`: (span, field, partition, reference, where it
+/// lives in a sealed partition).
+type Job<'a> = (usize, u32, usize, PayloadRef, Option<(Sealed<'a>, Loc)>);
+
+/// Work for one thread step: one `payloads.blob` entry, or one sealed frame with every
+/// job that reads from it. `(raw bytes to decompress, job indices)`.
+type Unit = (u64, Vec<usize>);
+
+/// Decompresses `unit` and returns its jobs' payloads in order. A job that is its whole
+/// frame takes the frame's buffer; others copy their slice of it.
+fn read_unit(blobs: &[BlobRef<'_>], jobs: &[Job<'_>], unit: &Unit) -> Result<Vec<Vec<u8>>> {
+    let first = &jobs[unit.1[0]];
+    let Some((s, loc)) = first.4 else {
+        return Ok(vec![blobs[first.2].read(first.3)?]);
+    };
+    let raw = s.decompress(loc.frame as usize)?;
+    if unit.1.len() == 1 && loc.at == 0 && loc.len as usize == raw.len() {
+        Sealed::slice(&raw, loc)?;
+        return Ok(vec![raw]);
+    }
+    unit.1
+        .iter()
+        .map(|&j| match jobs[j].4 {
+            Some((_, loc)) => Ok(Sealed::slice(&raw, loc)?.to_vec()),
+            None => Err(corrupt("payload job without a frame")),
+        })
+        .collect()
+}
+
+/// Fills the payload fields in `mask` of every span. Payloads are read in units (a blob
+/// entry, or a sealed frame decompressed once for all its payloads). Decompression
+/// dominates large traces, so with enough bytes the units are spread over threads by
+/// size, largest first onto the least loaded thread, and the calling thread takes one
+/// share.
 fn fill_payloads(
     blobs: &[BlobRef<'_>],
     merged: &mut [Merged],
     mask: u32,
     st: &mut ReadStats,
 ) -> Result<()> {
-    // (span, field, partition, reference) of each payload to read.
-    let mut jobs = Vec::new();
+    let mut jobs: Vec<Job<'_>> = Vec::new();
     for (i, m) in merged.iter().enumerate() {
         for bit in PAYLOAD_FIELDS {
             if mask & bit != 0
                 && let Some((pi, h)) = m.pieces().rev().find(|(_, h)| h.has(bit))
             {
-                jobs.push((i, bit, *pi, payload_ref(h, bit)));
+                let r = payload_ref(h, bit);
+                jobs.push((i, bit, *pi, r, blobs[*pi].locate(r)?));
             }
         }
     }
-    let raw: usize = jobs.iter().map(|j| j.3.raw_len as usize).sum();
-    let threads = cores()
-        .min(8)
-        .min(raw / PARALLEL_PAYLOAD_BYTES + 1)
-        .min(jobs.len());
-    let read = |jobs: &[(usize, u32, usize, PayloadRef)]| -> Result<Vec<Vec<u8>>> {
-        jobs.iter()
-            .map(|(_, _, pi, r)| blobs[*pi].read(*r))
-            .collect()
-    };
-    let mut bins: Vec<Vec<(usize, u32, usize, PayloadRef)>> = vec![Vec::new(); threads.max(1)];
-    if threads <= 1 {
-        bins[0] = jobs;
-    } else {
-        jobs.sort_unstable_by_key(|j| Reverse(j.3.raw_len));
-        let mut load = vec![0u64; threads];
-        for j in jobs {
-            let b = (0..threads).min_by_key(|&b| load[b]).unwrap_or(0);
-            load[b] += j.3.raw_len as u64 + 64;
-            bins[b].push(j);
+    let mut units: Vec<Unit> = Vec::new();
+    let mut by_frame: HashMap<(usize, u32), usize> = HashMap::new();
+    for (j, job) in jobs.iter().enumerate() {
+        match job.4 {
+            None => units.push((job.3.raw_len as u64 + 64, vec![j])),
+            Some((s, loc)) => match by_frame.entry((job.2, loc.frame)) {
+                Entry::Occupied(e) => units[*e.get()].1.push(j),
+                Entry::Vacant(e) => {
+                    e.insert(units.len());
+                    units.push((s.frame(loc.frame as usize).raw_len as u64 + 64, vec![j]));
+                }
+            },
         }
     }
-    let results: Vec<Result<Vec<Vec<u8>>>> = std::thread::scope(|sc| {
-        let spawned: Vec<_> = bins[1..]
-            .iter()
-            .map(|b| sc.spawn(move || read(b)))
-            .collect();
+    let raw: u64 = units.iter().map(|u| u.0).sum();
+    let threads = cores()
+        .min(8)
+        .min(raw as usize / PARALLEL_PAYLOAD_BYTES + 1)
+        .min(units.len());
+    let mut bins: Vec<Vec<Unit>> = vec![Vec::new(); threads.max(1)];
+    if threads <= 1 {
+        bins[0] = units;
+    } else {
+        units.sort_unstable_by_key(|u| Reverse(u.0));
+        let mut load = vec![0u64; threads];
+        for u in units {
+            let b = (0..threads).min_by_key(|&b| load[b]).unwrap_or(0);
+            load[b] += u.0;
+            bins[b].push(u);
+        }
+    }
+    let read = |bin: &[Unit]| -> Result<Vec<Vec<Vec<u8>>>> {
+        bin.iter().map(|u| read_unit(blobs, &jobs, u)).collect()
+    };
+    let results: Vec<Result<Vec<Vec<Vec<u8>>>>> = std::thread::scope(|sc| {
+        let spawned: Vec<_> = bins[1..].iter().map(|b| sc.spawn(|| read(b))).collect();
         let mut out = vec![read(&bins[0])];
         for h in spawned {
             out.push(h.join().unwrap_or_else(|_| {
@@ -183,9 +267,12 @@ fn fill_payloads(
         out
     });
     for (bin, bytes) in bins.iter().zip(results) {
-        for (&(i, bit, _, _), b) in bin.iter().zip(bytes?) {
-            st.payload_bytes_decompressed += b.len() as u64;
-            set_payload(&mut merged[i].span, bit, b)?;
+        for (unit, payloads) in bin.iter().zip(bytes?) {
+            for (&j, b) in unit.1.iter().zip(payloads) {
+                let (i, bit, ..) = jobs[j];
+                st.payload_bytes_decompressed += b.len() as u64;
+                set_payload(&mut merged[i].span, bit, b)?;
+            }
         }
     }
     Ok(())
@@ -396,7 +483,7 @@ pub(crate) fn search(
         return Ok(done(Vec::new(), st, ph));
     }
     let toks: Vec<&[u8]> = want.iter().map(Vec::as_slice).collect();
-    let blobs: Vec<BlobRef<'_>> = views.iter().map(|v| v.blob()).collect();
+    let mut pay = Payloads::new(views);
 
     // Spans of spread traces, merged, newest first (popped from the back).
     let mut spread: Vec<(RunKey, Merged)> = Vec::new();
@@ -466,7 +553,7 @@ pub(crate) fn search(
             if let Some((k2, _)) = spread.last() {
                 heap.push((*k2, usize::MAX));
             }
-            load_payloads(&blobs, &mut m, INPUTS | OUTPUTS, &mut st)?;
+            load_payloads(&mut pay, &mut m, INPUTS | OUTPUTS, &mut st)?;
             if matches(&want, m.span.inputs.as_deref(), m.span.outputs.as_deref()) {
                 hits.push(hit(&m.span.project, k));
             }
@@ -494,9 +581,7 @@ pub(crate) fn search(
                     if !h.has(bit) {
                         return Ok(None);
                     }
-                    let bytes = v.blob().read(payload_ref(h, bit))?;
-                    st.payload_bytes_decompressed += bytes.len() as u64;
-                    Ok(Some(bytes))
+                    pay.read(pi, payload_ref(h, bit), &mut st).map(Some)
                 };
                 let (i, o) = (read(INPUTS)?, read(OUTPUTS)?);
                 if matches(&want, i.as_deref(), o.as_deref()) {
