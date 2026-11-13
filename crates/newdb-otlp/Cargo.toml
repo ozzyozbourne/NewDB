@@ -1,0 +1,11 @@
+[package]
+name = "newdb-otlp"
+description = "OTLP trace decoding and GenAI attribute mapping into newdb Spans. Lane 3 owns this crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+newdb-types = { workspace = true }
+prost = { workspace = true }

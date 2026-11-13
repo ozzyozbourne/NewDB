@@ -1,0 +1,18 @@
+[package]
+name = "newdb-server"
+description = "HTTP server: OTLP/HTTP ingest on 4318 and the trace/runs/search JSON API. Lane 3 owns this crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+newdb-types = { workspace = true }
+newdb-otlp = { workspace = true }
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+
+[dev-dependencies]
+newdb-testkit = { workspace = true }

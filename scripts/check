@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# The full check, cheapest steps first. There is no CI: this is the safety net, and every
+# agent runs it before calling work done. Usage:
+#   scripts/check              everything
+#   scripts/check <crate>...   only these crates' clippy and tests (fast lane loop)
+set -euo pipefail
+cd "$(dirname "$0")/.."
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}"
+
+t0=$SECONDS
+step() { printf '\n== %s (%ss)\n' "$1" "$((SECONDS - t0))"; }
+
+scope=(--workspace)
+if (($#)); then
+  scope=()
+  for c in "$@"; do scope+=(-p "$c"); done
+fi
+
+step "cargo fmt --check"
+cargo fmt --all --check
+
+step "layering lint"
+scripts/lint-layers
+
+step "cargo clippy ${scope[*]}"
+cargo clippy "${scope[@]}" --all-targets --locked -q -- -D warnings
+
+if (($# == 0)); then
+  step "duplicate dependency versions"
+  dups=$(cargo tree --workspace -e normal -d --locked 2>/dev/null | grep -E '^[a-z]' || true)
+  if [[ -n "$dups" ]]; then
+    echo "duplicate versions (fix or accept explicitly):"
+    echo "$dups"
+  fi
+fi
+
+step "cargo nextest run ${scope[*]}"
+cargo nextest run "${scope[@]}" --locked --no-fail-fast
+
+if (($# == 0)) && [[ -d python/tests ]] && [[ -x .venv/bin/python ]]; then
+  step "Python end-to-end tests"
+  .venv/bin/maturin develop -q -m crates/newdb-py/Cargo.toml
+  .venv/bin/python -m pytest -q python/tests
+fi
+
+step "ok"

@@ -1,0 +1,17 @@
+[package]
+name = "newdb-layouts"
+description = "Layouts: per-partition data structures built from the log. Lane 2 owns this crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+newdb-types = { workspace = true }
+bytemuck = { workspace = true }
+fst = { workspace = true }
+roaring = { workspace = true }
+xorf = { workspace = true }
+
+[dev-dependencies]
+newdb-testkit = { workspace = true }

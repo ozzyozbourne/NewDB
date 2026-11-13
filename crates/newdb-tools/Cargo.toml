@@ -1,0 +1,11 @@
+[package]
+name = "newdb-tools"
+description = "bench workloads and runner, counting allocator, report printing for inspect and verify. Lane 4 owns this crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+newdb-types = { workspace = true }
+newdb-testkit = { workspace = true }

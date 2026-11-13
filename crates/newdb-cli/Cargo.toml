@@ -1,0 +1,19 @@
+[package]
+name = "newdb-cli"
+description = "The newdb binary: serve, inspect, verify, rebuild, bench. Lane 4 owns this crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "newdb"
+path = "src/main.rs"
+
+[dependencies]
+newdb-types = { workspace = true }
+newdb-engine = { workspace = true }
+newdb-otlp = { workspace = true }
+newdb-server = { workspace = true }
+newdb-tools = { workspace = true }
+newdb-testkit = { workspace = true }

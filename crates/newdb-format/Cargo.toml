@@ -1,0 +1,17 @@
+[package]
+name = "newdb-format"
+description = "Engine file formats: log records, payload store, string table, MANIFEST. Lane 1 owns this crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+newdb-types = { workspace = true }
+bytemuck = { workspace = true }
+crc32c = { workspace = true }
+xxhash-rust = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+newdb-testkit = { workspace = true }

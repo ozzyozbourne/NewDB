@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Source-text lint, no build needed (runs in well under a second). Enforces DESIGN.md
+# section 11: the core crates stay free of heavy and macro-heavy dependencies, and only
+# the integrator's crates are depended on across lanes.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+core=(newdb-types newdb-format newdb-layouts newdb-engine newdb-testkit)
+banned='serde|tokio|prost|hyper|pyo3|async-trait|anyhow|thiserror|clap|rand'
+fail=0
+
+for c in "${core[@]}"; do
+  if grep -nE "^($banned)([-_a-z]*)? *=" "crates/$c/Cargo.toml"; then
+    echo "error: crates/$c/Cargo.toml: core crates must not depend on ($banned)"
+    fail=1
+  fi
+done
+
+# The layouts crate must not depend on the engine or format crates (lane independence).
+if grep -nE '^newdb-(engine|format) *=' crates/newdb-layouts/Cargo.toml; then
+  echo "error: newdb-layouts must depend only on newdb-types"
+  fail=1
+fi
+
+# No unwrap() or expect() in format decoding outside tests: corrupt input must return
+# Error::Corrupt. Lines after a file's first `#[cfg(test)]` are test code.
+hits=$(awk 'FNR == 1 { t = 0 } /#\[cfg\(test\)\]/ { t = 1 }
+  !t && /\.(unwrap|expect)\(/ && !/^[[:space:]]*\/\// { print FILENAME ":" FNR ": " $0 }' \
+  $(find crates/newdb-format/src -name '*.rs'))
+if [[ -n "$hits" ]]; then
+  echo "$hits"
+  echo "error: unwrap/expect in newdb-format outside tests (return Error::Corrupt instead)"
+  fail=1
+fi
+
+exit "$fail"

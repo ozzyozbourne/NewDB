@@ -1,0 +1,17 @@
+[package]
+name = "newdb-py"
+description = "Python binding (module `newdb`). Lane 4 owns this crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "newdb"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+newdb-types = { workspace = true }
+newdb-engine = { workspace = true }
+newdb-testkit = { workspace = true }
+pyo3 = { workspace = true }

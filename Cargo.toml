@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+newdb-types = { path = "crates/newdb-types" }
+newdb-format = { path = "crates/newdb-format" }
+newdb-layouts = { path = "crates/newdb-layouts" }
+newdb-engine = { path = "crates/newdb-engine" }
+newdb-otlp = { path = "crates/newdb-otlp" }
+newdb-server = { path = "crates/newdb-server" }
+newdb-testkit = { path = "crates/newdb-testkit" }
+newdb-tools = { path = "crates/newdb-tools" }
+
+# Storage
+crc32c = "0.6.9"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+zstd = { version = "0.14.4", default-features = false, features = ["pkg-config", "zdict_builder"] }
+memmap2 = "0.9.12"
+bytemuck = "1.25.2"
+
+# Layouts
+fst = "0.4.7"
+roaring = "0.12.0"
+xorf = "0.13.0"
+
+# OTLP and server
+prost = "0.14.6"
+tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+hyper = { version = "1.12.0", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+http-body-util = "0.1.5"
+
+# Python binding
+pyo3 = { version = "0.30.1", features = ["extension-module", "abi3-py39"] }
+
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+[profile.release]
+lto = "thin"
+
+[profile.bench]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+
+# Used only by scripts/release.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

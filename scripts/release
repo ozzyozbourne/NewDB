@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Slow, rare work: the fully optimized binary and the reference bench run.
+# Never part of the edit loop.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
+
+cargo build --profile dist -p newdb-cli --locked
+mkdir -p target/bench
+out="target/bench/$(git rev-parse --short HEAD 2>/dev/null || echo local).json"
+target/dist/newdb bench --data "$(mktemp -d)" --no-fsync --out "$out"
+echo "bench report: $out"

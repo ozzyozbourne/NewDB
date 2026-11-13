@@ -1,0 +1,10 @@
+[package]
+name = "newdb-testkit"
+description = "Brute-force reference Store (the oracle), a deterministic span generator, and differential checks."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+newdb-types = { workspace = true }

@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Orb setup for NewDB. Amp saves the result as a project snapshot, so new orbs start with
+# the toolchain installed and every dependency already compiled. Safe to run again on top
+# of an earlier snapshot.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+step() { printf '[setup %(%T)T] %s\n' -1 "$1"; }
+
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+
+# --- System packages: mold (linker), libzstd (linked, not compiled), clang (for mold) ---
+need=()
+command -v mold >/dev/null || need+=(mold)
+dpkg -s libzstd-dev >/dev/null 2>&1 || need+=(libzstd-dev)
+dpkg -s pkg-config >/dev/null 2>&1 || need+=(pkg-config)
+if ((${#need[@]})); then
+  step "apt install ${need[*]}"
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${need[@]}" >/dev/null
+fi
+
+# --- Rust: the toolchain pinned in rust-toolchain.toml ----------------------------------
+if ! command -v rustup >/dev/null; then
+  step "Installing rustup"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+fi
+step "Rust toolchain from rust-toolchain.toml"
+rustup show active-toolchain >/dev/null 2>&1 || rustup toolchain install
+
+# --- cargo-nextest (prebuilt binary) ------------------------------------------------
+if ! command -v cargo-nextest >/dev/null; then
+  step "Installing cargo-nextest"
+  curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$HOME/.cargo/bin"
+fi
+
+# --- Python: maturin and the OpenTelemetry SDK for end-to-end tests ---------------------
+if [[ ! -x .venv/bin/python ]]; then
+  step "Creating .venv"
+  uv venv -q .venv
+fi
+step "Python packages"
+uv pip install -q --python .venv/bin/python maturin pytest \
+  opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+
+# --- Warm the build so the snapshot holds compiled dependencies ------------------------
+# Cap jobs: orbs have no swap. Dev and test profiles are what agents rebuild most.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}"
+step "cargo fetch"
+cargo fetch --locked
+step "cargo build --workspace --all-targets (dev)"
+cargo build --workspace --all-targets --locked
+step "cargo nextest run --no-run"
+cargo nextest run --workspace --no-run --locked >/dev/null
+step "cargo clippy (warms clippy's cache)"
+cargo clippy --workspace --all-targets --locked -q 2>/dev/null || true
+step "done"

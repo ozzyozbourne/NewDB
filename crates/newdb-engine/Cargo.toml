@@ -1,0 +1,16 @@
+[package]
+name = "newdb-engine"
+description = "The storage engine: partitions, group commit, recovery, snapshots, retention, verify. Lane 1 owns this crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+newdb-types = { workspace = true }
+newdb-format = { workspace = true }
+newdb-layouts = { workspace = true }
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+newdb-testkit = { workspace = true }
