@@ -2,7 +2,7 @@
 //! requests in the shapes OpenLLMetry (LangGraph), OpenInference (LangChain) and the OTel
 //! GenAI semantic conventions emit, and the spans they map to. The `.expected.json` files are
 //! newdb's rendering of the resulting `Span`s. A missing or different file fails the test;
-//! run with `UPDATE_GOLDEN=1` to rewrite them after a deliberate change, and review the diff.
+//! run with `NEWDB_BLESS=1` to rewrite them after a deliberate change, and review the diff.
 //!
 //! The expected files were checked field by field against Forge's own `.expected.json` for
 //! the same fixtures (2026-11-13): run_type, model, provider, prompt/completion tokens, cost,
@@ -114,14 +114,14 @@ fn check_golden(name: &str) -> Vec<Span> {
 
     let got = render(&spans);
     let path = fixtures().join(format!("{name}.expected.json"));
-    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+    if std::env::var_os("NEWDB_BLESS").is_some() {
         std::fs::write(&path, &got).unwrap();
     }
     let want = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("{}: {e}; create it with UPDATE_GOLDEN=1", path.display()));
+        .unwrap_or_else(|e| panic!("{}: {e}; create it with NEWDB_BLESS=1", path.display()));
     assert_eq!(
         got, want,
-        "{name} mapped differently; rerun with UPDATE_GOLDEN=1 if intended"
+        "{name} mapped differently; rerun with NEWDB_BLESS=1 if intended"
     );
     spans
 }
