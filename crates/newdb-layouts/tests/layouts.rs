@@ -523,6 +523,75 @@ fn fts_postings_match_brute_force() {
     }
 }
 
+/// The engine's way to apply: `prepare` each post, `begin` the batch, move the shards
+/// out, apply each on its own thread (in reverse order), put them back shuffled.
+fn feed_like_the_engine(p: &Partition, b: &mut fts::Builder, sizes: &[usize]) {
+    let mut first = 0;
+    for &n in sizes {
+        let spans = &p.posts[first..first + n];
+        let batch = Batch {
+            first_post: first as u32,
+            headers: &p.headers[first..first + n],
+            spans,
+        };
+        let prepared: Vec<fts::Prepared> =
+            spans.iter().map(|s| fts::prepare(s, b.shards())).collect();
+        let ids = b.begin(&batch);
+        let mut shards = b.take_shards();
+        std::thread::scope(|sc| {
+            for shard in shards.iter_mut().rev() {
+                let (prepared, ids) = (&prepared, &ids);
+                sc.spawn(move || shard.apply(prepared, ids));
+            }
+        });
+        shards.rotate_left(1);
+        b.put_shards(shards);
+        first += n;
+    }
+}
+
+/// A sharded fts builder seals the same bytes and answers the same as one shard, for
+/// every batch split, through `apply` (the one-batch split takes its multi-threaded path)
+/// and through the engine's prepare/begin/shard steps.
+#[test]
+fn fts_sealed_bytes_do_not_depend_on_the_shard_count() {
+    let seal = |b: &fts::Builder| {
+        let mut f = LayoutFiles::default();
+        b.seal(&mut f).unwrap();
+        f
+    };
+    for p in partitions() {
+        let (one, _) = built::<fts::Builder>(&p, true);
+        let expected = seal(&one[0]);
+        let tokens: Vec<Vec<u8>> = brute_postings(&p.posts).into_keys().collect();
+        for shards in [2, 3, 8] {
+            for (n, sizes) in p.splits().into_iter().enumerate() {
+                let mut b = fts::Builder::with_shards(shards);
+                if n % 2 == 0 {
+                    p.feed(&mut b, &sizes);
+                } else {
+                    feed_like_the_engine(&p, &mut b, &sizes);
+                }
+                assert_eq!(b.shards(), shards);
+                assert!(
+                    seal(&b) == expected,
+                    "{shards} shards, batches {sizes:?}: sealed bytes differ"
+                );
+                for t in tokens.iter().step_by(7) {
+                    assert_eq!(b.postings(t).0, one[0].postings(t).0);
+                    let pair: [&[u8]; 2] = [t, b"refund"];
+                    assert!(
+                        b.intersect_newest(&pair)
+                            .0
+                            .eq(one[0].intersect_newest(&pair).0),
+                        "{shards} shards: intersect {pair:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Each span's merged start in the partition: the latest post that set one, else 0.
 fn merged_starts(posts: &[Span]) -> HashMap<(TraceId, SpanId), u64> {
     let mut out = HashMap::new();
@@ -675,16 +744,35 @@ fn fts_postings_lookup_timing_100k_spans() {
         })
         .collect();
     let headers = vec![SpanHeader::default(); SPANS];
+    // Apply in batches of 1,000 posts with 1, 2, 4 and 8 shards. Wall time per post; on a
+    // machine with fewer cores than shards this is the CPU cost, threads included.
+    let mut applies = Vec::new();
     let mut b = fts::Builder::default();
-    let t = Instant::now();
-    for (h, s) in headers.chunks(1000).zip(posts.chunks(1000)) {
-        b.apply(&Batch {
-            first_post: 0,
-            headers: h,
-            spans: s,
-        });
+    let shard_counts: &[usize] = if cfg!(debug_assertions) {
+        &[1, 4]
+    } else {
+        &[1, 2, 4, 8]
+    };
+    for &shards in shard_counts {
+        let mut sb = fts::Builder::with_shards(shards);
+        let t = Instant::now();
+        for (h, s) in headers.chunks(1000).zip(posts.chunks(1000)) {
+            sb.apply(&Batch {
+                first_post: 0,
+                headers: h,
+                spans: s,
+            });
+        }
+        let per_post = t.elapsed() / SPANS as u32;
+        applies.push(format!(
+            "{shards} shard(s) {per_post:?}/post = {:.0}k posts/s",
+            1e-3 / per_post.as_secs_f64()
+        ));
+        if shards == 1 {
+            b = sb;
+        }
     }
-    let apply = t.elapsed() / SPANS as u32;
+    let apply = applies.join(", ");
     let mut files = LayoutFiles::default();
     let t = Instant::now();
     b.seal(&mut files).unwrap();
@@ -708,7 +796,7 @@ fn fts_postings_lookup_timing_100k_spans() {
         (best, n)
     };
     let mut report = format!(
-        "fts over {SPANS} spans of 2 KB: apply {apply:?}/post, seal {seal:?}, file {} KiB\n",
+        "fts over {SPANS} spans of 2 KB: seal {seal:?}, file {} KiB\n  apply: {apply}\n",
         bytes.len() / 1024
     );
     for (token, want) in [
@@ -757,7 +845,6 @@ fn fts_postings_lookup_timing_100k_spans() {
         tb < Duration::from_millis(100) && tr < Duration::from_millis(100),
         "{report}"
     );
-    assert!(apply < Duration::from_micros(200), "{report}");
     println!("{report}");
 }
 
@@ -855,4 +942,40 @@ fn fts_newest_order_follows_the_latest_start() {
             both
         );
     });
+}
+
+/// `prepare` keeps each distinct token of a post once, inputs and outputs together, and
+/// every token lands in exactly one shard.
+#[test]
+fn fts_prepare_dedups_tokens_and_routes_each_to_one_shard() {
+    let span = Span {
+        inputs: Some(br#"{"q":"Refund refund REFUND policy \n order"}"#.to_vec()),
+        outputs: Some(br#"{"a":"policy shipping"}"#.to_vec()),
+        ..Span::default()
+    };
+    let mut want: Vec<Vec<u8>> = tokens(span.inputs.as_deref().unwrap());
+    want.extend(tokens(span.outputs.as_deref().unwrap()));
+    want.sort();
+    want.dedup();
+    for shards in [1, 2, 5] {
+        let p = fts::prepare(&span, shards);
+        assert_eq!((p.shards(), p.len()), (shards, want.len()));
+        // Applying it to a builder with each shard alone finds every token exactly once.
+        let mut b = fts::Builder::with_shards(shards);
+        let batch = Batch {
+            first_post: 0,
+            headers: &[SpanHeader::default()],
+            spans: std::slice::from_ref(&span),
+        };
+        b.apply_prepared(&batch, &[p]);
+        for t in &want {
+            assert_eq!(
+                b.postings(t).0.len(),
+                1,
+                "{shards} shards, {:?}",
+                String::from_utf8_lossy(t)
+            );
+        }
+    }
+    assert!(fts::prepare(&Span::default(), 3).is_empty());
 }

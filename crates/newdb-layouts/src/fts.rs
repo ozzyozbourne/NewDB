@@ -52,7 +52,7 @@ use newdb_types::text::for_each_token;
 use newdb_types::{Error, Result, SpanId, TraceId};
 use roaring::RoaringBitmap;
 
-use crate::fx::FxHashMap;
+use crate::fx::{FxHashMap, hash_with_seed};
 use crate::{Batch, Cost, FileSet, LayoutBuilder, LayoutFiles, file};
 
 pub const NAME: &str = "fts";
@@ -71,7 +71,25 @@ pub type Hit = (u64, TraceId, SpanId);
 /// hit within about `DENSE` steps.
 const DENSE: u64 = 32;
 
-#[derive(Default)]
+/// A batch whose posts carry at least this many bytes of text per worker thread is
+/// tokenized and indexed on several threads; smaller ones are not worth starting threads.
+const BYTES_PER_WORKER: usize = 64 * 1024;
+
+/// The in-memory index of the active partition.
+///
+/// Tokens are split by hash into shards ([`Builder::with_shards`]); each token and its
+/// postings live in one shard, so shards index a batch independently, on different
+/// threads. The sealed file and every answer are the same for every shard count and every
+/// split of posts into batches.
+///
+/// [`LayoutBuilder::apply`] does everything, on scoped threads for large batches. An
+/// engine that runs the steps on its own threads uses:
+///
+/// 1. [`prepare`] on each post, anywhere (it is pure), with this builder's shard count;
+/// 2. [`Builder::begin`] for the batch, on the builder's thread (cheap, serial);
+/// 3. [`Shard::apply`] of every shard to the batch's prepared posts, on any threads, with
+///    the shards moved out by [`Builder::take_shards`] and back by [`Builder::put_shards`]
+///    before the next `begin`, query or seal.
 pub struct Builder {
     /// Spans by id, in order of first arrival.
     keys: Vec<Key>,
@@ -80,13 +98,262 @@ pub struct Builder {
     ids: FxHashMap<Key, u32>,
     /// Every span, newest first.
     order: BTreeSet<Reverse<(u64, TraceId, SpanId, u32)>>,
-    /// Token → token id.
+    shards: Vec<Shard>,
+    /// How many shards this builder has, also while they are taken out.
+    shard_count: usize,
+}
+
+impl Default for Builder {
+    fn default() -> Builder {
+        Builder::with_shards(1)
+    }
+}
+
+/// One shard of the token dictionary. Moved out of its builder with
+/// [`Builder::take_shards`] so it can apply a batch on another thread.
+pub struct Shard {
+    index: usize,
+    count: usize,
+    /// Token → token id (within this shard).
     tokens: FxHashMap<Box<[u8]>, u32>,
     /// By token id.
     terms: Vec<Term>,
     /// Token ids with pending span ids in the batch being applied.
     touched: Vec<u32>,
+    /// Posts this shard has applied, so each post adds to a token's postings once.
     posts: u32,
+}
+
+/// The span id of each post of a batch, from [`Builder::begin`].
+pub struct SpanIds {
+    ids: Vec<u32>,
+    shards: usize,
+}
+
+/// The distinct tokens of one post's `inputs` and `outputs`, grouped by the shard that
+/// indexes them: the output of [`prepare`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Prepared {
+    /// Every token of the post, lowercased, back to back (repeats included).
+    bytes: Vec<u8>,
+    /// `(start, end)` in `bytes` of each distinct token, shard 0's first.
+    tokens: Vec<(u32, u32)>,
+    /// Shard `k`'s tokens are `tokens[first[k]..first[k + 1]]`.
+    first: Vec<u32>,
+}
+
+impl Prepared {
+    /// The shard count this was prepared for.
+    pub fn shards(&self) -> usize {
+        self.first.len().saturating_sub(1)
+    }
+
+    /// Number of distinct tokens.
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// Token bytes this carries, to size work.
+    pub fn bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn shard_tokens(&self, k: usize) -> impl Iterator<Item = &[u8]> {
+        let range = self.first[k] as usize..self.first[k + 1] as usize;
+        self.tokens[range]
+            .iter()
+            .map(|&(a, b)| &self.bytes[a as usize..b as usize])
+    }
+}
+
+/// Reused per thread by [`prepare`], so a post costs no table allocation.
+#[derive(Default)]
+struct Scratch {
+    /// `(hash, start, end)` of every token of the post.
+    toks: Vec<(u64, u32, u32)>,
+    /// Open-addressing set over `toks` indices: `(generation, index)`.
+    table: Vec<(u32, u32)>,
+    generation: u32,
+    distinct: Vec<u32>,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::default();
+}
+
+/// Tokenizes one post for a builder with `shards` shards: each distinct token of its
+/// `inputs` and `outputs` once, routed to its shard. Pure, so the engine can run it on
+/// the ingesting threads; the result is the same on every machine.
+pub fn prepare(span: &newdb_types::Span, shards: usize) -> Prepared {
+    let shards = shards.max(1);
+    let len = |x: &Option<Vec<u8>>| x.as_ref().map_or(0, Vec::len);
+    let mut bytes: Vec<u8> = Vec::with_capacity(len(&span.inputs) + len(&span.outputs));
+    SCRATCH.with(|cell| {
+        let Scratch {
+            toks,
+            table,
+            generation,
+            distinct,
+        } = &mut *cell.borrow_mut();
+        toks.clear();
+        distinct.clear();
+        for text in [&span.inputs, &span.outputs].into_iter().flatten() {
+            for_each_token(text, |t| {
+                let start = bytes.len() as u32;
+                bytes.extend_from_slice(t);
+                toks.push((hash_with_seed(t, ROUTE_SEED), start, bytes.len() as u32));
+            });
+        }
+        // Drop repeats with an open-addressing set; a new generation empties it.
+        let cap = (toks.len() * 2).next_power_of_two().max(16);
+        if table.len() < cap {
+            table.resize(cap, (0, 0));
+        }
+        *generation = generation.wrapping_add(1);
+        if *generation == 0 {
+            table.fill((0, 0));
+            *generation = 1;
+        }
+        let tok = |&(_, a, b): &(u64, u32, u32)| &bytes[a as usize..b as usize];
+        let mut first = vec![0u32; shards + 1];
+        for (i, t) in toks.iter().enumerate() {
+            let mut slot = (t.0 as usize) & (cap - 1);
+            loop {
+                let (g, j) = table[slot];
+                if g != *generation {
+                    table[slot] = (*generation, i as u32);
+                    distinct.push(i as u32);
+                    first[route(t.0, shards) + 1] += 1;
+                    break;
+                }
+                let u = &toks[j as usize];
+                if u.0 == t.0 && tok(u) == tok(t) {
+                    break;
+                }
+                slot = (slot + 1) & (cap - 1);
+            }
+        }
+        // Counting sort by shard.
+        for k in 0..shards {
+            first[k + 1] += first[k];
+        }
+        let mut next = first.clone();
+        let mut tokens = vec![(0u32, 0u32); distinct.len()];
+        for &i in distinct.iter() {
+            let (h, a, b) = toks[i as usize];
+            let k = route(h, shards);
+            tokens[next[k] as usize] = (a, b);
+            next[k] += 1;
+        }
+        Prepared {
+            bytes,
+            tokens,
+            first,
+        }
+    })
+}
+
+/// Seed of the shard-routing hash, so it is independent of the hash the shard maps use.
+const ROUTE_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+
+fn route(hash: u64, shards: usize) -> usize {
+    ((hash as u128 * shards as u128) >> 64) as usize
+}
+
+fn shard_of(token: &[u8], shards: usize) -> usize {
+    if shards == 1 {
+        return 0;
+    }
+    route(hash_with_seed(token, ROUTE_SEED), shards)
+}
+
+impl Shard {
+    fn new(index: usize, count: usize) -> Shard {
+        Shard {
+            index,
+            count,
+            tokens: FxHashMap::default(),
+            terms: Vec::new(),
+            touched: Vec::new(),
+            posts: 0,
+        }
+    }
+
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Indexes this shard's tokens of a batch: `prepared[i]` is the batch's post `i`,
+    /// prepared for this builder's shard count, and `ids` came from [`Builder::begin`]
+    /// for the same batch.
+    ///
+    /// # Panics
+    /// If `prepared` was made for another shard count or another batch.
+    pub fn apply(&mut self, prepared: &[Prepared], ids: &SpanIds) {
+        assert_eq!(ids.shards, self.count, "fts: SpanIds from another builder");
+        assert_eq!(
+            prepared.len(),
+            ids.ids.len(),
+            "fts: prepared posts and batch differ"
+        );
+        for (p, &id) in prepared.iter().zip(&ids.ids) {
+            assert_eq!(
+                p.shards(),
+                self.count,
+                "fts: prepared for another shard count"
+            );
+            self.posts += 1;
+            for t in p.shard_tokens(self.index) {
+                self.add(t, id);
+            }
+        }
+        self.flush();
+    }
+
+    /// Adds span `id` to `token`'s postings, once per post.
+    #[inline]
+    fn add(&mut self, token: &[u8], id: u32) {
+        let tid = match self.tokens.get(token) {
+            Some(&tid) => tid,
+            None => {
+                let tid = self.terms.len() as u32;
+                self.tokens.insert(token.into(), tid);
+                self.terms.push(Term::default());
+                tid
+            }
+        };
+        let term = &mut self.terms[tid as usize];
+        if term.stamp != self.posts {
+            term.stamp = self.posts;
+            if term.pending.is_empty() {
+                self.touched.push(tid);
+            }
+            term.pending.push(id);
+        }
+    }
+
+    /// Moves the batch's pending span ids into the postings.
+    fn flush(&mut self) {
+        for tid in self.touched.drain(..) {
+            let Term {
+                postings, pending, ..
+            } = &mut self.terms[tid as usize];
+            // Posts of the same span in one batch add its id more than once.
+            pending.sort_unstable();
+            pending.dedup();
+            // New spans have ids above every earlier one: append those in bulk. `append`
+            // takes only ids above the current max, so anything it refuses is inserted.
+            let bulk = postings.max().is_none_or(|max| pending[0] > max);
+            if !bulk || postings.append(pending.iter().copied()).is_err() {
+                postings.extend(pending.iter().copied());
+            }
+            pending.clear();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -96,11 +363,81 @@ struct Term {
     /// Span ids of the current batch, added to `postings` at the end of `apply`: one pass
     /// per bitmap while it is in cache, instead of a cache miss per insert.
     pending: Vec<u32>,
-    /// The last post (counting from 1) that added to `pending`.
+    /// The shard's post count when this term was last added to.
     stamp: u32,
 }
 
 impl Builder {
+    /// A builder whose token dictionary is split into `shards` shards (at least 1). The
+    /// sealed bytes and every answer are the same for every shard count.
+    pub fn with_shards(shards: usize) -> Builder {
+        let n = shards.max(1);
+        Builder {
+            keys: Vec::new(),
+            starts: Vec::new(),
+            ids: FxHashMap::default(),
+            order: BTreeSet::new(),
+            shards: (0..n).map(|k| Shard::new(k, n)).collect(),
+            shard_count: n,
+        }
+    }
+
+    pub fn shards(&self) -> usize {
+        self.shard_count
+    }
+
+    /// Records the batch's spans and their start times, and returns each post's span id
+    /// for [`Shard::apply`]. Call once per batch, in log order, before its shards apply it.
+    pub fn begin(&mut self, batch: &Batch<'_>) -> SpanIds {
+        let ids = batch
+            .spans
+            .iter()
+            .map(|s| self.span((s.trace_id, s.span_id), s.start_ns))
+            .collect();
+        SpanIds {
+            ids,
+            shards: self.shard_count,
+        }
+    }
+
+    /// Moves the shards out, to apply on other threads. Queries and `seal` need them back.
+    pub fn take_shards(&mut self) -> Vec<Shard> {
+        std::mem::take(&mut self.shards)
+    }
+
+    /// Puts back every shard [`Builder::take_shards`] moved out, in any order.
+    ///
+    /// # Panics
+    /// If a shard is missing or belongs to a builder with another shard count.
+    pub fn put_shards(&mut self, mut shards: Vec<Shard>) {
+        shards.sort_by_key(|s| s.index);
+        let ok = shards.len() == self.shard_count
+            && shards
+                .iter()
+                .enumerate()
+                .all(|(k, s)| s.index == k && s.count == self.shard_count);
+        assert!(ok, "fts: put_shards needs exactly this builder's shards");
+        self.shards = shards;
+    }
+
+    /// `begin` and every shard's `apply`, on scoped threads when the batch is large.
+    pub fn apply_prepared(&mut self, batch: &Batch<'_>, prepared: &[Prepared]) {
+        let ids = self.begin(batch);
+        let bytes: usize = prepared.iter().map(Prepared::bytes).sum();
+        if self.shard_count == 1 || bytes < BYTES_PER_WORKER {
+            for shard in &mut self.shards {
+                shard.apply(prepared, &ids);
+            }
+            return;
+        }
+        let ids = &ids;
+        std::thread::scope(|sc| {
+            for shard in &mut self.shards {
+                sc.spawn(move || shard.apply(prepared, ids));
+            }
+        });
+    }
+
     /// Spans of this partition mentioning `token` (already tokenized: lowercase ASCII),
     /// sorted ascending, without duplicates.
     pub fn postings(&self, token: &[u8]) -> (Vec<(TraceId, SpanId)>, Cost) {
@@ -180,9 +517,11 @@ impl Builder {
     }
 
     fn bitmap(&self, token: &[u8]) -> Option<&RoaringBitmap> {
-        self.tokens
+        let shard = &self.shards[shard_of(token, self.shards.len())];
+        shard
+            .tokens
             .get(token)
-            .map(|&t| &self.terms[t as usize].postings)
+            .map(|&t| &shard.terms[t as usize].postings)
     }
 
     /// The span's id, creating it, and its merged start updated with `start`.
@@ -212,53 +551,42 @@ impl Builder {
 
 impl LayoutBuilder for Builder {
     fn apply(&mut self, batch: &Batch<'_>) {
-        for span in batch.spans {
-            let id = self.span((span.trace_id, span.span_id), span.start_ns);
-            self.posts += 1;
-            let stamp = self.posts;
-            let Builder {
-                tokens,
-                terms,
-                touched,
-                ..
-            } = self;
-            for text in [&span.inputs, &span.outputs].into_iter().flatten() {
-                for_each_token(text, |t| {
-                    let tid = match tokens.get(t) {
-                        Some(&tid) => tid,
-                        None => {
-                            let tid = terms.len() as u32;
-                            tokens.insert(t.into(), tid);
-                            terms.push(Term::default());
-                            tid
-                        }
-                    };
-                    // Each post adds to a token's postings once.
-                    let term = &mut terms[tid as usize];
-                    if term.stamp != stamp {
-                        term.stamp = stamp;
-                        if term.pending.is_empty() {
-                            touched.push(tid);
-                        }
-                        term.pending.push(id);
-                    }
-                });
+        let spans = batch.spans;
+        let n = self.shard_count;
+        let text = |s: &newdb_types::Span| {
+            s.inputs.as_ref().map_or(0, Vec::len) + s.outputs.as_ref().map_or(0, Vec::len)
+        };
+        if n == 1 {
+            // One shard: index tokens as the tokenizer finds them, without `prepare`.
+            let ids = self.begin(batch);
+            let shard = &mut self.shards[0];
+            for (span, &id) in spans.iter().zip(&ids.ids) {
+                shard.posts += 1;
+                for text in [&span.inputs, &span.outputs].into_iter().flatten() {
+                    for_each_token(text, |t| shard.add(t, id));
+                }
             }
+            shard.flush();
+            return;
         }
-        for tid in self.touched.drain(..) {
-            let Term {
-                postings, pending, ..
-            } = &mut self.terms[tid as usize];
-            pending.sort_unstable();
-            pending.dedup();
-            // New spans have ids above every earlier one: append those in bulk. `append`
-            // takes only ids above the current max, so anything it refuses is inserted.
-            let bulk = postings.max().is_none_or(|max| pending[0] > max);
-            if !bulk || postings.append(pending.iter().copied()).is_err() {
-                postings.extend(pending.iter().copied());
-            }
-            pending.clear();
-        }
+        let bytes: usize = spans.iter().map(text).sum();
+        let workers = (bytes / BYTES_PER_WORKER).clamp(1, n);
+        let prepared: Vec<Prepared> = if workers == 1 {
+            spans.iter().map(|s| prepare(s, n)).collect()
+        } else {
+            let chunk = spans.len().div_ceil(workers);
+            std::thread::scope(|sc| {
+                let parts: Vec<_> = spans
+                    .chunks(chunk)
+                    .map(|c| sc.spawn(move || c.iter().map(|s| prepare(s, n)).collect::<Vec<_>>()))
+                    .collect();
+                parts
+                    .into_iter()
+                    .flat_map(|p| p.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                    .collect()
+            })
+        };
+        self.apply_prepared(batch, &prepared);
     }
 
     fn seal(&self, out: &mut LayoutFiles) -> Result<()> {
@@ -274,20 +602,23 @@ impl LayoutBuilder for Builder {
             spans.push(*sp);
         }
 
-        let mut terms: Vec<(&[u8], u32)> = self.tokens.iter().map(|(t, &i)| (&**t, i)).collect();
-        terms.sort_unstable();
+        let mut terms: Vec<(&[u8], &RoaringBitmap)> = self
+            .shards
+            .iter()
+            .flat_map(|sh| {
+                sh.tokens
+                    .iter()
+                    .map(|(t, &i)| (&**t, &sh.terms[i as usize].postings))
+            })
+            .collect();
+        terms.sort_unstable_by_key(|(t, _)| *t);
         let mut offsets: Vec<u64> = Vec::with_capacity(terms.len() + 1);
         let mut postings: Vec<u8> = Vec::new();
         let mut dict = fst::MapBuilder::memory();
         let mut positions: Vec<u32> = Vec::new();
-        for (i, (token, tid)) in terms.iter().enumerate() {
+        for (i, (token, ids)) in terms.iter().enumerate() {
             positions.clear();
-            positions.extend(
-                self.terms[*tid as usize]
-                    .postings
-                    .iter()
-                    .map(|id| position[id as usize]),
-            );
+            positions.extend(ids.iter().map(|id| position[id as usize]));
             positions.sort_unstable();
             let mut bitmap = RoaringBitmap::from_sorted_iter(positions.iter().copied())
                 .map_err(|e| Error::InvalidInput(format!("{FILE}: {e}")))?;

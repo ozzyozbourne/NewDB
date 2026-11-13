@@ -58,4 +58,12 @@ impl Hasher for FxHasher {
     }
 }
 
+/// The hash of `bytes` from a hasher started at `seed`: independent of the hashes the
+/// maps use for the same bytes when `seed` differs from 0.
+pub(crate) fn hash_with_seed(bytes: &[u8], seed: u64) -> u64 {
+    let mut h = FxHasher(seed);
+    h.write(bytes);
+    h.finish()
+}
+
 pub(crate) type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
