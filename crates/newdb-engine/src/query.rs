@@ -10,7 +10,7 @@ use std::time::Instant;
 use newdb_format::sealed::{Loc, Sealed};
 use newdb_layouts::{Cost, fts};
 use newdb_types::header::field::{END, ERROR, INPUTS, MODEL, NAME, OUTPUTS, PARENT, SESSION};
-use newdb_types::text::tokens;
+use newdb_types::text::{for_each_token, tokens};
 use newdb_types::{
     PayloadRef, Read, ReadStats, Result, Run, RunKey, RunQuery, RunSummary, RunType, SearchHit,
     SearchQuery, Span, SpanHeader, Status, TraceId, TraceQuery,
@@ -675,10 +675,25 @@ pub(crate) fn search(
     Ok(done(hits, st, ph))
 }
 
+/// Whether every token of `want` (sorted and deduplicated, as [`tokens`] returns them)
+/// appears in `inputs` or `outputs`. Scans the payloads without collecting their tokens.
 fn matches(want: &[Vec<u8>], inputs: Option<&[u8]>, outputs: Option<&[u8]>) -> bool {
-    let mut have = tokens(inputs.unwrap_or_default());
-    have.extend(tokens(outputs.unwrap_or_default()));
-    want.iter().all(|w| have.contains(w))
+    let mut found = vec![false; want.len()];
+    let mut left = want.len();
+    for text in [inputs, outputs].into_iter().flatten() {
+        for_each_token(text, |t| {
+            if let Ok(i) = want.binary_search_by(|w| w.as_slice().cmp(t))
+                && !found[i]
+            {
+                found[i] = true;
+                left -= 1;
+            }
+        });
+        if left == 0 {
+            return true;
+        }
+    }
+    left == 0
 }
 
 fn hit(project: &str, k: RunKey) -> SearchHit {
