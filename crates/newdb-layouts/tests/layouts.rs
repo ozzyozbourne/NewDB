@@ -446,6 +446,7 @@ fn fts_postings_match_brute_force() {
     for p in partitions() {
         let (builders, sealed) = built::<fts::Builder>(&p, true);
         let expected = brute_postings(&p.posts);
+        let starts = merged_starts(&p.posts);
         assert!(expected.len() > 30);
         with_files(&sealed, |files| {
             let r = fts::Reader::open(files).unwrap();
@@ -473,9 +474,74 @@ fn fts_postings_match_brute_force() {
                     "reader, token {:?}",
                     String::from_utf8_lossy(token)
                 );
+                let newest = newest_first(&want, &starts);
+                for b in &builders {
+                    assert_eq!(b.postings_newest(token).0.collect::<Vec<_>>(), newest);
+                }
+                assert_eq!(r.postings_newest(token).0.collect::<Vec<_>>(), newest);
             }
+            // Intersections of token pairs (and one triple), newest first.
+            let toks: Vec<&[u8]> = expected.keys().map(Vec::as_slice).collect();
+            let mut sets: Vec<Vec<&[u8]>> = toks
+                .iter()
+                .step_by(3)
+                .zip(toks.iter().skip(1).step_by(5))
+                .map(|(a, b)| vec![*a, *b])
+                .collect();
+            sets.push(vec![b"refund", b"policy", b"order"]);
+            sets.push(vec![b"refund", b"nonexistentword"]);
+            sets.push(vec![]);
+            let mut nonempty = 0;
+            for set in &sets {
+                let mut want: Vec<(TraceId, SpanId)> = Vec::new();
+                if let Some((first, rest)) = set.split_first() {
+                    want = expected
+                        .get(*first)
+                        .map_or(vec![], |w| w.iter().copied().collect());
+                    want.retain(|k| {
+                        rest.iter()
+                            .all(|t| expected.get(*t).is_some_and(|w| w.contains(k)))
+                    });
+                }
+                nonempty += !want.is_empty() as usize;
+                let newest = newest_first(&want, &starts);
+                for b in &builders {
+                    assert_eq!(
+                        b.intersect_newest(set).0.collect::<Vec<_>>(),
+                        newest,
+                        "{set:?}"
+                    );
+                }
+                assert_eq!(
+                    r.intersect_newest(set).0.collect::<Vec<_>>(),
+                    newest,
+                    "{set:?}"
+                );
+            }
+            assert!(nonempty > 5);
         });
     }
+}
+
+/// Each span's merged start in the partition: the latest post that set one, else 0.
+fn merged_starts(posts: &[Span]) -> HashMap<(TraceId, SpanId), u64> {
+    let mut out = HashMap::new();
+    for s in posts {
+        let e = out.entry((s.trace_id, s.span_id)).or_insert(0);
+        if let Some(v) = s.start_ns {
+            *e = v;
+        }
+    }
+    out
+}
+
+fn newest_first(
+    keys: &[(TraceId, SpanId)],
+    starts: &HashMap<(TraceId, SpanId), u64>,
+) -> Vec<fts::Hit> {
+    let mut v: Vec<fts::Hit> = keys.iter().map(|&(t, s)| (starts[&(t, s)], t, s)).collect();
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    v
 }
 
 #[test]
@@ -564,27 +630,45 @@ fn readers_reject_truncated_and_foreign_files() {
     }
 }
 
-/// Postings lookups over 100k spans, from the builder and from the sealed file. Forge's
-/// search took 765 ms on compacted segments against 19 ms uncompacted; here a lookup's
-/// cost depends only on the token's postings, so a rare token stays cheap however large
-/// the partition, and the bounds are loose enough for debug builds.
+/// fts over 100k spans of about 2 KB each, out-of-order start times: apply cost per
+/// post, single-token lookups, and newest-50 of a two-token intersection, from the
+/// builder and the sealed file. Forge's search took 765 ms on compacted segments against
+/// 19 ms uncompacted; here a lookup's cost depends only on the postings involved. The
+/// bounds are loose enough for debug builds, which use 20k spans to keep `scripts/check`
+/// fast; run with `--release --no-capture` for numbers.
 #[test]
 fn fts_postings_lookup_timing_100k_spans() {
     use std::time::{Duration, Instant};
-    const SPANS: usize = 100_000;
+    const SPANS: usize = if cfg!(debug_assertions) {
+        20_000
+    } else {
+        100_000
+    };
     let mut rng = Rng::new(5);
-    let words = ["refund", "policy", "order", "invoice", "shipping", "delay"];
+    let vocab: Vec<String> = (0..2000).map(|i| format!("word{i}")).collect();
     let posts: Vec<Span> = (0..SPANS)
         .map(|i| {
-            let mut text = format!("{{\"content\":\"common {}", rng.pick(&words));
+            let mut text = String::with_capacity(2100);
+            text.push_str("{\"content\":\"common");
+            for (w, p) in [("refund", 0.5), ("policy", 0.4)] {
+                if rng.chance(p) {
+                    text.push(' ');
+                    text.push_str(w);
+                }
+            }
             if i % 100 == 0 {
                 text.push_str(" rare");
+            }
+            while text.len() < 2048 {
+                text.push(' ');
+                text.push_str(rng.pick(&vocab));
             }
             text.push_str("\"}");
             Span {
                 project: "p".into(),
                 trace_id: TraceId([(i / 50) as u8; 16]),
                 span_id: SpanId((rng.next_u64() | 1).to_le_bytes()),
+                start_ns: Some(rng.below(3_600_000_000_000)),
                 inputs: Some(text.into_bytes()),
                 ..Span::default()
             }
@@ -592,6 +676,7 @@ fn fts_postings_lookup_timing_100k_spans() {
         .collect();
     let headers = vec![SpanHeader::default(); SPANS];
     let mut b = fts::Builder::default();
+    let t = Instant::now();
     for (h, s) in headers.chunks(1000).zip(posts.chunks(1000)) {
         b.apply(&Batch {
             first_post: 0,
@@ -599,8 +684,11 @@ fn fts_postings_lookup_timing_100k_spans() {
             spans: s,
         });
     }
+    let apply = t.elapsed() / SPANS as u32;
     let mut files = LayoutFiles::default();
+    let t = Instant::now();
     b.seal(&mut files).unwrap();
+    let seal = t.elapsed();
     let (name, bytes) = &files.files[0];
     let mut words64 = vec![0u64; bytes.len().div_ceil(8)];
     bytemuck::cast_slice_mut::<u64, u8>(&mut words64)[..bytes.len()].copy_from_slice(bytes);
@@ -619,7 +707,10 @@ fn fts_postings_lookup_timing_100k_spans() {
         }
         (best, n)
     };
-    let mut report = format!("fts over {SPANS} spans, file {} KiB\n", bytes.len() / 1024);
+    let mut report = format!(
+        "fts over {SPANS} spans of 2 KB: apply {apply:?}/post, seal {seal:?}, file {} KiB\n",
+        bytes.len() / 1024
+    );
     for (token, want) in [
         (&b"common"[..], SPANS),
         (b"rare", SPANS / 100),
@@ -629,7 +720,7 @@ fn fts_postings_lookup_timing_100k_spans() {
         let (tr, nr) = time(&|| r.postings(token).0.len());
         assert_eq!((nb, nr), (want, want));
         report += &format!(
-            "  {:8} {:6} hits: builder {:>9.3?}, reader {:>9.3?}\n",
+            "  postings {:8} {:6} hits: builder {:>9.3?}, reader {:>9.3?}\n",
             String::from_utf8_lossy(token),
             want,
             tb,
@@ -638,7 +729,35 @@ fn fts_postings_lookup_timing_100k_spans() {
         assert!(tr < Duration::from_millis(100), "{report}");
     }
     let rare = r.postings(b"rare").1;
-    assert!(rare.bytes_read < 30_000, "rare token read {rare:?}");
+    assert!(
+        rare.bytes_read < 40 * SPANS as u64 / 100,
+        "rare token read {rare:?}"
+    );
+
+    // Newest 50 spans mentioning both tokens, against brute force.
+    let both: &[&[u8]] = &[b"refund", b"policy"];
+    let mut expected: Vec<fts::Hit> = posts
+        .iter()
+        .filter(|s| {
+            let t = tokens(s.inputs.as_deref().unwrap());
+            both.iter().all(|w| t.iter().any(|x| x == w))
+        })
+        .map(|s| (s.start_ns.unwrap(), s.trace_id, s.span_id))
+        .collect();
+    expected.sort_unstable_by(|a, b| b.cmp(a));
+    expected.truncate(50);
+    let newest = |hits: Vec<fts::Hit>| {
+        assert_eq!(hits, expected);
+        hits.len()
+    };
+    let (tb, _) = time(&|| newest(b.intersect_newest(both).0.take(50).collect()));
+    let (tr, _) = time(&|| newest(r.intersect_newest(both).0.take(50).collect()));
+    report += &format!("  newest 50 of refund AND policy: builder {tb:>9.3?}, reader {tr:>9.3?}\n");
+    assert!(
+        tb < Duration::from_millis(100) && tr < Duration::from_millis(100),
+        "{report}"
+    );
+    assert!(apply < Duration::from_micros(200), "{report}");
     println!("{report}");
 }
 
@@ -692,4 +811,48 @@ fn runs_newest_50_timing_200k_runs() {
     assert_eq!(got, expected[..50]);
     println!("runs_by_time: {RUNS} runs applied in {apply:?}; newest 50 errors p50 {p50:?}");
     assert!(p50 < Duration::from_millis(5), "newest 50 took {p50:?}");
+}
+
+/// A later post that moves a span's start reorders it in the newest-first postings, in
+/// the builder and in the sealed file; a post without a start keeps the merged one.
+#[test]
+fn fts_newest_order_follows_the_latest_start() {
+    let post = |s: u8, start: Option<u64>, text: &str| Span {
+        project: "p".into(),
+        trace_id: TraceId([1; 16]),
+        span_id: SpanId([s; 8]),
+        start_ns: start,
+        inputs: Some(text.as_bytes().to_vec()),
+        ..Span::default()
+    };
+    let p = Partition::new(&[
+        post(1, Some(10), "alpha"),
+        post(2, Some(20), "alpha beta"),
+        post(3, None, "alpha"),
+        post(1, Some(30), "beta"),
+        post(2, None, "gamma"),
+    ]);
+    let (builders, sealed) = built::<fts::Builder>(&p, true);
+    let hit = |s: u8, start: u64| (start, TraceId([1; 16]), SpanId([s; 8]));
+    let alpha = vec![hit(1, 30), hit(2, 20), hit(3, 0)];
+    let both = vec![hit(1, 30), hit(2, 20)];
+    with_files(&sealed, |files| {
+        let r = fts::Reader::open(files).unwrap();
+        for b in &builders {
+            assert_eq!(b.postings_newest(b"alpha").0.collect::<Vec<_>>(), alpha);
+            assert_eq!(
+                b.intersect_newest(&[b"beta", b"alpha"])
+                    .0
+                    .collect::<Vec<_>>(),
+                both
+            );
+        }
+        assert_eq!(r.postings_newest(b"alpha").0.collect::<Vec<_>>(), alpha);
+        assert_eq!(
+            r.intersect_newest(&[b"beta", b"alpha"])
+                .0
+                .collect::<Vec<_>>(),
+            both
+        );
+    });
 }
