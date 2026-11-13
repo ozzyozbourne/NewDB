@@ -1,12 +1,27 @@
 //! The one writer thread: group commit, partition lifecycle (create, recover, seal),
 //! retention and layout rebuilds. Everything that changes files runs here, in order.
+//!
+//! A batch moves through three stages, each on its own threads, so consecutive batches
+//! overlap:
+//!
+//! 1. [`prepare`], on the ingesting thread: hash and compress the payloads.
+//! 2. The writer: deduplicate, append payloads, `fdatasync`, append the log, `fdatasync`,
+//!    acknowledge. The batch is durable now but not yet visible.
+//! 3. The applier: apply the batch to the active partition's layouts, in log order, on
+//!    persistent worker threads, then publish it.
+//!
+//! [`Visible::wait`] bridges 2 and 3: every read first waits until each batch
+//! acknowledged before it started is applied, so `ingest` returning still means every
+//! later read sees the batch.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use newdb_format::manifest::{self, Manifest, PartitionEntry};
@@ -21,14 +36,15 @@ use crate::files::{
     remove_dir_if_exists, sync_dir, write_synced,
 };
 use crate::part::{
-    Blob, Body, Layouts, Live, Mode, PAYLOAD_FIELDS, Part, Stats, Strings, corrupt, open_sealed,
-    present, replay,
+    Blob, Body, Group, Layouts, Live, Mode, PARALLEL_APPLY, PAYLOAD_FIELDS, Part, Stats, Strings,
+    cores, corrupt, open_sealed, present, replay,
 };
 
 pub(crate) type Ack = Sender<Result<()>>;
 
 pub(crate) enum Msg {
-    Ingest(Vec<Span>, Ack),
+    /// Posts and their payloads as [`prepare`] stored them, in the same order.
+    Ingest(Vec<Span>, Vec<Prepared>, Ack),
     Seal(Ack),
     Retention(Ack),
     Rebuild(Option<String>, Ack),
@@ -47,13 +63,20 @@ struct Active {
     pay_len: u64,
     dedup: HashMap<payload::Hash, Vec<PayloadRef>>,
     posts: u32,
+    /// The string table including batches not yet applied (the live one lags).
+    strings: Strings,
+    traces: HashSet<TraceId>,
+    /// Traces of this partition that sealed partitions have too, for `overlap.bin`.
+    overlap: Vec<TraceId>,
 }
 
 pub(crate) struct Writer {
     inner: Arc<Inner>,
     manifest: Manifest,
     active: Option<Active>,
-    enc: payload::Encoder,
+    applier: Applier,
+    /// Batches written since open; the last one's number.
+    seq: u64,
     next_version: u64,
     next_id: u64,
     retention_hour: u64,
@@ -81,10 +104,11 @@ impl Writer {
             .unwrap_or(0);
         let max_id = manifest.partitions.iter().map(|p| p.id).max().unwrap_or(0);
         let mut w = Writer {
+            applier: Applier::start(inner.clone())?,
             inner,
             manifest,
             active: None,
-            enc: payload::Encoder::new()?,
+            seq: 0,
             next_version: max_version + 1,
             next_id: max_id + 1,
             retention_hour: 0,
@@ -118,18 +142,18 @@ impl Writer {
                 },
             };
             match msg {
-                Msg::Ingest(spans, ack) => {
+                Msg::Ingest(spans, pre, ack) => {
                     // Group commit: take what queued up while the last batch was being
                     // written and synced, without waiting for more. An idle writer
                     // commits a lone request at once; `commit_interval` is only an
                     // upper bound on the wait.
-                    let mut batch = vec![(spans, ack)];
+                    let mut batch = vec![(spans, pre, ack)];
                     let mut bytes = size(&batch[0].0);
                     while bytes < self.inner.config.commit_bytes {
                         match rx.try_recv() {
-                            Ok(Msg::Ingest(s, a)) => {
+                            Ok(Msg::Ingest(s, p, a)) => {
                                 bytes += size(&s);
-                                batch.push((s, a));
+                                batch.push((s, p, a));
                             }
                             Ok(other) => {
                                 stashed = Some(other);
@@ -138,7 +162,9 @@ impl Writer {
                             Err(_) => break,
                         }
                     }
-                    self.commit(batch);
+                    if !self.commit(batch) {
+                        return;
+                    }
                 }
                 Msg::Seal(ack) => {
                     let _ = ack.send(self.seal());
@@ -150,7 +176,7 @@ impl Writer {
                     let _ = ack.send(self.rebuild(layout.as_deref()));
                 }
                 Msg::Stop(ack) => {
-                    let _ = ack.send(Ok(()));
+                    let _ = ack.send(self.applier.drain());
                     return;
                 }
             }
@@ -171,12 +197,27 @@ impl Writer {
         Ok(())
     }
 
-    fn commit(&mut self, batch: Vec<(Vec<Span>, Ack)>) {
-        let (spans, acks): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
-        let spans: Vec<Span> = spans.into_iter().flatten().collect();
-        let res = self.roll().and_then(|_| self.write(spans));
+    /// Writes and acknowledges a group of ingests and queues it for the applier. False when
+    /// the applier is gone, which stops the writer.
+    fn commit(&mut self, batch: Vec<(Vec<Span>, Vec<Prepared>, Ack)>) -> bool {
+        let (mut spans, mut pre, mut acks) = (Vec::new(), Vec::new(), Vec::new());
+        for (s, p, a) in batch {
+            spans.extend(s);
+            pre.extend(p);
+            acks.push(a);
+        }
+        let mut res = self.roll().and_then(|_| self.write(spans, pre));
+        if let Ok(Some(job)) = &mut res {
+            self.seq += 1;
+            job.seq = self.seq;
+            self.inner.visible.acked.store(self.seq, Ordering::SeqCst);
+        }
         for ack in acks {
-            let _ = ack.send(res.as_ref().map(|_| ()).map_err(dup));
+            let _ = ack.send(res.as_ref().map(drop).map_err(dup));
+        }
+        match res {
+            Ok(Some(job)) => self.applier.send(Apply::Batch(job)),
+            _ => true,
         }
     }
 
@@ -251,9 +292,11 @@ impl Writer {
         traces.dedup();
         let overlap = present(&self.inner.parts(), &traces)?;
         self.inner.add_multi(&overlap);
+        let mut strings = Strings::default();
+        for s in &r.strings.list {
+            strings.push(s.clone());
+        }
         let live = Live {
-            traces: traces.into_iter().collect(),
-            overlap,
             strings: r.strings,
             blob: Blob::File {
                 file: File::open(dir.join(PAYLOADS))?,
@@ -281,15 +324,18 @@ impl Writer {
             pay_len: r.pay_len,
             dedup: r.dedup,
             posts,
+            strings,
+            traces: traces.into_iter().collect(),
+            overlap,
         });
         Ok(())
     }
 
-    /// Appends `spans` to the active partition (creating it if needed), syncs, and makes
-    /// them visible to readers.
-    fn write(&mut self, spans: Vec<Span>) -> Result<()> {
+    /// Appends `spans` to the active partition (creating it if needed) and syncs. Returns
+    /// the batch for the applier, which makes it visible, or `None` when there was nothing.
+    fn write(&mut self, spans: Vec<Span>, pre: Vec<Prepared>) -> Result<Option<Job>> {
         if spans.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         if self.active.is_none() {
             let hour = self.now_hour();
@@ -297,9 +343,6 @@ impl Writer {
         }
         let Some(a) = self.active.as_mut() else {
             return Err(corrupt("no active partition"));
-        };
-        let Some(live) = a.part.live() else {
-            return Err(corrupt("active partition is sealed"));
         };
         let mut enc = Encoding {
             log: Vec::new(),
@@ -312,18 +355,14 @@ impl Writer {
         for (i, span) in spans.iter_mut().enumerate() {
             span.version = self.next_version + i as u64;
         }
-        let (headers, new_traces) = {
-            let g = live.read().unwrap_or_else(|e| e.into_inner());
-            let headers = enc.encode(&spans, &g.strings, &a.dedup, &a.pay, &mut self.enc)?;
-            let mut new: Vec<TraceId> = headers
-                .iter()
-                .map(|h| h.trace_id)
-                .filter(|t| !g.traces.contains(t))
-                .collect();
-            new.sort_unstable();
-            new.dedup();
-            (headers, new)
-        };
+        let headers = enc.encode(&spans, &pre, &a.strings, &a.dedup, &a.pay)?;
+        let mut new_traces: Vec<TraceId> = headers
+            .iter()
+            .map(|h| h.trace_id)
+            .filter(|t| !a.traces.contains(t))
+            .collect();
+        new_traces.sort_unstable();
+        new_traces.dedup();
         let sync = self.inner.config.fsync;
         let written = (|| -> Result<()> {
             // Payloads first, so a durable log record never points at missing payloads.
@@ -358,28 +397,25 @@ impl Writer {
         for (h, refs) in enc.new_dedup {
             a.dedup.entry(h).or_default().extend(refs);
         }
-        let mut g = live.write().unwrap_or_else(|e| e.into_inner());
-        g.traces.extend(new_traces);
-        g.overlap.extend(shared);
-        for s in enc.new_strings.list {
-            g.strings.push(s);
+        a.traces.extend(new_traces);
+        a.overlap.extend(shared);
+        for s in &enc.new_strings.list {
+            a.strings.push(s.clone());
         }
-        if let Blob::File { len, .. } = &mut g.blob {
-            *len = a.pay_len;
-        }
-        g.layouts.apply(&Batch {
+        let posts = Posts {
             first_post: a.posts,
-            headers: &headers,
-            spans: &spans,
-        });
-        for h in &headers {
-            g.stats.add(h);
-            g.keys.insert((h.project, h.trace_id, h.span_id));
-        }
-        g.stats.spans = g.keys.len() as u64;
-        a.posts += headers.len() as u32;
-        self.next_version += headers.len() as u64;
-        Ok(())
+            headers,
+            spans,
+        };
+        a.posts += posts.headers.len() as u32;
+        self.next_version += posts.headers.len() as u64;
+        Ok(Some(Job {
+            part: a.part.clone(),
+            seq: 0,
+            posts,
+            strings: enc.new_strings.list,
+            pay_len: a.pay_len,
+        }))
     }
 
     /// Writes the active partition's layouts and string table, lists it in MANIFEST and
@@ -388,6 +424,7 @@ impl Writer {
         let Some(a) = self.active.as_ref() else {
             return Ok(());
         };
+        self.applier.drain()?;
         let Some(live) = a.part.live() else {
             return Err(corrupt("active partition is sealed"));
         };
@@ -407,7 +444,7 @@ impl Writer {
                 write_layout(&dir, def, &files)?;
             }
             write_synced(&dir.join(STRINGS), &strtbl::encode(&g.strings.list))?;
-            let mut shared = g.overlap.clone();
+            let mut shared = a.overlap.clone();
             shared.sort_unstable();
             write_synced(&dir.join(OVERLAP), &overlap::encode(&shared))?;
             sync_dir(&dir)?;
@@ -510,6 +547,263 @@ impl Writer {
             }
         }
         Ok(())
+    }
+}
+
+/// Which acknowledged batches readers can see yet.
+#[derive(Default)]
+pub(crate) struct Visible {
+    /// The last acknowledged batch.
+    acked: AtomicU64,
+    shown: Mutex<Shown>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct Shown {
+    /// The last batch the applier made visible.
+    applied: u64,
+    /// The applier has exited; nothing more becomes visible.
+    stopped: bool,
+}
+
+impl Visible {
+    /// Waits until every batch acknowledged before this call is visible.
+    pub fn wait(&self) {
+        let target = self.acked.load(Ordering::SeqCst);
+        let mut s = self.shown.lock().unwrap_or_else(|e| e.into_inner());
+        while s.applied < target && !s.stopped {
+            s = self.changed.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn update(&self, f: impl FnOnce(&mut Shown)) {
+        f(&mut self.shown.lock().unwrap_or_else(|e| e.into_inner()));
+        self.changed.notify_all();
+    }
+}
+
+/// A written batch on its way to the layouts.
+struct Job {
+    part: Arc<Part>,
+    seq: u64,
+    posts: Posts,
+    /// Strings the batch added to the partition's table, in ID order.
+    strings: Vec<String>,
+    /// Committed length of the payload file after the batch.
+    pay_len: u64,
+}
+
+/// The posts of a written batch, as the layouts receive them.
+struct Posts {
+    first_post: u32,
+    headers: Vec<SpanHeader>,
+    spans: Vec<Span>,
+}
+
+impl Posts {
+    fn batch(&self) -> Batch<'_> {
+        Batch {
+            first_post: self.first_post,
+            headers: &self.headers,
+            spans: &self.spans,
+        }
+    }
+}
+
+impl Job {
+    /// Appends the next batch of the same partition.
+    fn merge(&mut self, next: Job) {
+        self.seq = next.seq;
+        self.posts.headers.extend(next.posts.headers);
+        self.posts.spans.extend(next.posts.spans);
+        self.strings.extend(next.strings);
+        self.pay_len = next.pay_len;
+    }
+}
+
+enum Apply {
+    Batch(Job),
+    /// Answered once every earlier batch is applied.
+    Drain(Sender<()>),
+}
+
+/// Written batches waiting for the applier. A full queue holds up the writer.
+const APPLY_QUEUE: usize = 4;
+
+/// The applier merges queued batches into one apply of at most this many posts.
+const MERGE_POSTS: usize = 8192;
+
+/// The writer's handle on the applier thread, which applies written batches to the
+/// active partition's layouts in log order and publishes them.
+struct Applier {
+    tx: Option<SyncSender<Apply>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Applier {
+    fn start(inner: Arc<Inner>) -> Result<Applier> {
+        let (tx, rx) = sync_channel(APPLY_QUEUE);
+        let thread = std::thread::Builder::new()
+            .name("newdb-apply".into())
+            .spawn(move || apply_loop(&inner, rx))?;
+        Ok(Applier {
+            tx: Some(tx),
+            thread: Some(thread),
+        })
+    }
+
+    /// Queues `m`; false when the applier is gone.
+    fn send(&self, m: Apply) -> bool {
+        self.tx.as_ref().is_some_and(|tx| tx.send(m).is_ok())
+    }
+
+    /// Waits until every batch sent so far is applied.
+    fn drain(&self) -> Result<()> {
+        let (tx, rx) = channel();
+        if self.send(Apply::Drain(tx)) && rx.recv().is_ok() {
+            return Ok(());
+        }
+        Err(corrupt("the layout applier stopped"))
+    }
+}
+
+impl Drop for Applier {
+    fn drop(&mut self) {
+        self.tx = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn apply_loop(inner: &Inner, rx: Receiver<Apply>) {
+    /// Marks the applier stopped however it exits, so readers do not wait for it.
+    struct Stopped<'a>(&'a Visible);
+    impl Drop for Stopped<'_> {
+        fn drop(&mut self) {
+            self.0.update(|s| s.stopped = true);
+        }
+    }
+    let _stopped = Stopped(&inner.visible);
+    let pool = Pool::new(cores().min(3) - 1);
+    let mut next = None;
+    loop {
+        let msg = match next.take() {
+            Some(m) => m,
+            None => match rx.recv() {
+                Ok(m) => m,
+                Err(_) => return,
+            },
+        };
+        match msg {
+            Apply::Drain(done) => {
+                let _ = done.send(());
+            }
+            Apply::Batch(mut job) => {
+                while job.posts.headers.len() < MERGE_POSTS {
+                    match rx.try_recv() {
+                        Ok(Apply::Batch(j)) if Arc::ptr_eq(&j.part, &job.part) => job.merge(j),
+                        Ok(other) => {
+                            next = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let seq = job.seq;
+                apply(&pool, job);
+                inner.visible.update(|s| s.applied = seq);
+            }
+        }
+    }
+}
+
+/// Applies a written batch to its partition's layouts. Readers wait on the write lock
+/// meanwhile, so they never see the layouts while their builders are out on the workers.
+fn apply(pool: &Pool, job: Job) {
+    let Some(live) = job.part.live() else {
+        return;
+    };
+    let mut g = live.write().unwrap_or_else(|e| e.into_inner());
+    for s in job.strings {
+        g.strings.push(s);
+    }
+    if let Blob::File { len, .. } = &mut g.blob {
+        *len = job.pay_len;
+    }
+    let posts = Arc::new(job.posts);
+    if posts.headers.len() >= PARALLEL_APPLY {
+        let groups = pool.run(g.layouts.take(), &posts);
+        g.layouts.put(groups);
+    } else {
+        g.layouts.apply_on(&posts.batch(), 1);
+    }
+    for h in &posts.headers {
+        g.stats.add(h);
+        g.keys.insert((h.project, h.trace_id, h.span_id));
+    }
+    g.stats.spans = g.keys.len() as u64;
+}
+
+/// Persistent threads that apply builder groups alongside the applier. A worker gets a
+/// group and the batch by value and sends the group back.
+struct Pool {
+    workers: Vec<Worker>,
+}
+
+struct Worker {
+    tx: Sender<(Group, Arc<Posts>)>,
+    rx: Receiver<Group>,
+}
+
+impl Pool {
+    fn new(n: usize) -> Pool {
+        let workers = (0..n)
+            .filter_map(|i| {
+                let (tx, work) = channel::<(Group, Arc<Posts>)>();
+                let (back, rx) = channel();
+                std::thread::Builder::new()
+                    .name(format!("newdb-apply-{}", i + 1))
+                    .spawn(move || {
+                        for (mut g, posts) in work {
+                            g.apply(&posts.batch());
+                            if back.send(g).is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .ok()
+                    .map(|_| Worker { tx, rx })
+            })
+            .collect();
+        Pool { workers }
+    }
+
+    /// Applies `posts` to every group, the first on this thread and the others on the
+    /// workers (or here when there are too few), and returns the groups.
+    fn run(&self, groups: impl IntoIterator<Item = Group>, posts: &Arc<Posts>) -> Vec<Group> {
+        let mut groups = groups.into_iter();
+        let mut here: Vec<Group> = groups.next().into_iter().collect();
+        let mut away = Vec::new();
+        let mut workers = self.workers.iter();
+        for g in groups {
+            match workers.next() {
+                Some(w) => match w.tx.send((g, posts.clone())) {
+                    Ok(()) => away.push(w),
+                    Err(e) => here.push(e.0.0),
+                },
+                None => here.push(g),
+            }
+        }
+        let b = posts.batch();
+        here.iter_mut().for_each(|g| g.apply(&b));
+        // A worker that panicked dropped its group: the layouts cannot continue.
+        here.extend(
+            away.into_iter()
+                .map(|w| w.rx.recv().expect("layout worker panicked")),
+        );
+        here
     }
 }
 
@@ -646,26 +940,26 @@ impl Encoding {
 
     /// Encodes a batch: string records and payload entries, then one post record per
     /// span. Payloads are deduplicated against the partition and within the batch first,
-    /// then the new ones are compressed and appended.
+    /// then the new ones are appended as the ingesting thread compressed them.
     fn encode(
         &mut self,
         spans: &[Span],
+        pre: &[Prepared],
         table: &Strings,
         committed: &HashMap<payload::Hash, Vec<PayloadRef>>,
         file: &File,
-        enc: &mut payload::Encoder,
     ) -> Result<Vec<SpanHeader>> {
         let mut headers: Vec<SpanHeader> = spans.iter().map(|s| self.scalars(s, table)).collect();
         // Every payload of the batch: (span, field), and where its stored copy comes from.
         let mut jobs: Vec<(usize, u32, Src)> = Vec::new();
-        let mut fresh: Vec<(&[u8], payload::Hash)> = Vec::new();
+        let mut fresh: Vec<(&[u8], &Stored)> = Vec::new();
         let mut by_hash: HashMap<payload::Hash, Vec<usize>> = HashMap::new();
-        for (i, s) in spans.iter().enumerate() {
-            for bit in PAYLOAD_FIELDS {
+        for (i, (s, p)) in spans.iter().zip(pre).enumerate() {
+            for stored in p {
+                let (bit, h) = (stored.bit, stored.hash);
                 let Some(raw) = payload_field(s, bit) else {
-                    continue;
+                    return Err(corrupt("prepared payload of an unset field"));
                 };
-                let h = payload::hash(raw);
                 if let Some(r) = self.committed(raw, h, committed, file)? {
                     jobs.push((i, bit, Src::Stored(r)));
                     continue;
@@ -675,7 +969,7 @@ impl Encoding {
                     Some(&k) => k,
                     None => {
                         same.push(fresh.len());
-                        fresh.push((raw, h));
+                        fresh.push((raw, stored));
                         fresh.len() - 1
                     }
                 };
@@ -683,9 +977,15 @@ impl Encoding {
             }
         }
         let mut refs = Vec::with_capacity(fresh.len());
-        for (raw, h) in &fresh {
-            let r = enc.append(raw, *h, self.pay_base, &mut self.pay)?;
-            self.new_dedup.entry(*h).or_default().push(r);
+        for (raw, p) in &fresh {
+            let r = payload::append_entry(
+                raw,
+                p.data.as_deref(),
+                p.hash,
+                self.pay_base,
+                &mut self.pay,
+            )?;
+            self.new_dedup.entry(p.hash).or_default().push(r);
             refs.push(r);
         }
         for (i, bit, r) in jobs {
@@ -748,6 +1048,79 @@ impl Encoding {
         h.fields = f;
         h
     }
+}
+
+/// One payload of a post as the ingesting thread prepared it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Stored {
+    pub bit: u32,
+    pub hash: payload::Hash,
+    /// The zstd frame, or `None` to store the bytes raw.
+    pub data: Option<Vec<u8>>,
+}
+
+/// The payloads of one post.
+pub(crate) type Prepared = Vec<Stored>;
+
+/// Below this many payload bytes per thread, splitting a batch costs more than it saves.
+const PARALLEL_BYTES: usize = 256 << 10;
+
+/// Hashes and compresses the payloads of `spans` on the calling thread, so concurrent
+/// ingests compress in parallel and the writer only deduplicates and appends. A large
+/// batch is split across a few scoped threads.
+pub(crate) fn prepare(spans: &[Span]) -> Result<Vec<Prepared>> {
+    let total: usize = spans.iter().map(|s| size(std::slice::from_ref(s))).sum();
+    prepare_on(
+        spans,
+        crate::part::cores().min(8).min(total / PARALLEL_BYTES + 1),
+    )
+}
+
+pub(crate) fn prepare_on(spans: &[Span], threads: usize) -> Result<Vec<Prepared>> {
+    if threads <= 1 {
+        return spans.iter().map(prepare_one).collect();
+    }
+    let chunk = spans.len().div_ceil(threads);
+    std::thread::scope(|sc| {
+        let parts: Vec<_> = spans
+            .chunks(chunk)
+            .map(|c| sc.spawn(move || c.iter().map(prepare_one).collect::<Result<Vec<_>>>()))
+            .collect();
+        let mut out = Vec::with_capacity(spans.len());
+        for p in parts {
+            let part = p
+                .join()
+                .map_err(|_| Error::Io(std::io::Error::other("compression thread panicked")))?;
+            out.extend(part?);
+        }
+        Ok(out)
+    })
+}
+
+thread_local! {
+    static ENCODER: std::cell::RefCell<Option<payload::Encoder>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn prepare_one(s: &Span) -> Result<Prepared> {
+    ENCODER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let enc = match slot.as_mut() {
+            Some(e) => e,
+            None => slot.insert(payload::Encoder::new()?),
+        };
+        let mut out = Vec::new();
+        for bit in PAYLOAD_FIELDS {
+            if let Some(raw) = payload_field(s, bit) {
+                out.push(Stored {
+                    bit,
+                    hash: payload::hash(raw),
+                    data: enc.compress(raw)?,
+                });
+            }
+        }
+        Ok(out)
+    })
 }
 
 /// Where a batch's payload is stored: an existing entry, or the `k`-th new one.

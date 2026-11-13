@@ -9,6 +9,8 @@
 //!   sets the trace count).
 //! - [`concurrent`]: readers during ingest and sealing see some prefix state, never older
 //!   than one they saw before.
+//! - [`concurrent_crash`]: SIGKILL while several threads ingest with fsync on keeps every
+//!   acknowledged batch, and each thread reads its own batch right after `ingest`.
 //! - [`seal_crash`]: a crash between layout writes and the MANIFEST update, simulated
 //!   exactly and by SIGKILL of a child process during `seal_active`.
 //!
@@ -16,6 +18,7 @@
 
 mod common;
 mod concurrent;
+mod concurrent_crash;
 mod pagination;
 mod randomized;
 mod seal_crash;
