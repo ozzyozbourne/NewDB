@@ -1,8 +1,21 @@
 //! Golden fixtures ported from Forge Trace DB (`forge-model/tests/fixtures`): OTLP/JSON
 //! requests in the shapes OpenLLMetry (LangGraph), OpenInference (LangChain) and the OTel
 //! GenAI semantic conventions emit, and the spans they map to. The `.expected.json` files are
-//! newdb's own rendering of the resulting `Span`s; run with `NEWDB_BLESS=1` to rewrite them
-//! after a deliberate change, and review the diff.
+//! newdb's rendering of the resulting `Span`s. A missing or different file fails the test;
+//! run with `NEWDB_BLESS=1` to rewrite them after a deliberate change, and review the diff.
+//!
+//! The expected files were checked field by field against Forge's own `.expected.json` for
+//! the same fixtures (2026-11-13): run_type, model, provider, prompt/completion tokens, cost,
+//! session, parent/root, status, error, name, times, inputs, outputs and events all match.
+//! Intentional differences, all from the newdb contract:
+//! - Project: newdb reads `newdb.project`, `forge.project`, then `service.name`, so the
+//!   OpenInference fixture is `rag-app` (Forge: `rag` from `openinference.project.name`) and
+//!   the GenAI fixture is `agent-sdk` (Forge: `default`).
+//! - `Span` has no tags, metadata or total-token fields, so `tag.tags`, `metadata`,
+//!   `traceloop.association.properties.user_id` and `*.total_tokens` stay in `attributes`
+//!   (Forge moved them to `tags`, `metadata` and `total_tokens`).
+//! - Spans no rule maps get `run_type: None` (read as `other`); Forge defaulted to `chain`.
+//!   No span in these fixtures hits that case.
 
 use std::path::PathBuf;
 
@@ -101,10 +114,11 @@ fn check_golden(name: &str) -> Vec<Span> {
 
     let got = render(&spans);
     let path = fixtures().join(format!("{name}.expected.json"));
-    if std::env::var_os("NEWDB_BLESS").is_some() || !path.exists() {
+    if std::env::var_os("NEWDB_BLESS").is_some() {
         std::fs::write(&path, &got).unwrap();
     }
-    let want = std::fs::read_to_string(&path).unwrap();
+    let want = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}; create it with NEWDB_BLESS=1", path.display()));
     assert_eq!(
         got, want,
         "{name} mapped differently; rerun with NEWDB_BLESS=1 if intended"
