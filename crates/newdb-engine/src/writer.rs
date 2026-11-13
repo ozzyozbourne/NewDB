@@ -16,17 +16,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
+use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use newdb_format::manifest::{self, Manifest, PartitionEntry};
 use newdb_format::{log, overlap, payload, strings as strtbl};
-use newdb_layouts::{Batch, LAYOUTS, LayoutDef, LayoutFiles};
+use newdb_layouts::{Batch, LAYOUTS, LayoutDef, LayoutFiles, fts};
 use newdb_types::header::field::*;
 use newdb_types::{Error, PayloadRef, Result, Span, SpanHeader, TraceId};
 
@@ -37,7 +38,7 @@ use crate::files::{
 };
 use crate::part::{
     Blob, Body, Group, Layouts, Live, Mode, PARALLEL_APPLY, PAYLOAD_FIELDS, Part, Stats, Strings,
-    cores, corrupt, open_sealed, present, replay,
+    cores, corrupt, fts_shards, open_sealed, present, replay,
 };
 
 pub(crate) type Ack = Sender<Result<()>>;
@@ -686,7 +687,7 @@ fn apply_loop(inner: &Inner, rx: Receiver<Apply>) {
         }
     }
     let _stopped = Stopped(&inner.visible);
-    let pool = Pool::new(cores().min(3) - 1);
+    let pool = Pool::new();
     let mut next = None;
     loop {
         let msg = match next.take() {
@@ -726,49 +727,150 @@ fn apply(pool: &Pool, job: Job) {
         return;
     };
     let mut g = live.write().unwrap_or_else(|e| e.into_inner());
+    let g = &mut *g;
     for s in job.strings {
         g.strings.push(s);
     }
     if let Blob::File { len, .. } = &mut g.blob {
         *len = job.pay_len;
     }
-    let posts = Arc::new(job.posts);
-    if posts.headers.len() >= PARALLEL_APPLY {
-        let groups = pool.run(g.layouts.take(), &posts);
-        g.layouts.put(groups);
-    } else {
-        g.layouts.apply_on(&posts.batch(), 1);
+    // fts records the batch's spans here, in log order. Then the workers tokenize the
+    // posts for the fts shards while trace_clustered and the rest apply, and then each
+    // fts shard indexes its tokens.
+    let ids = g.layouts.fts.begin(&job.posts.batch());
+    let applying = Arc::new(Applying {
+        posts: job.posts,
+        ids,
+        tokens: OnceLock::new(),
+    });
+    let parallel = applying.posts.headers.len() >= PARALLEL_APPLY;
+    let [fts, tc, rest] = g.layouts.take();
+    // The workers tokenize; the applier runs the two light groups, the first and last
+    // items (the pool sends what does not fit on a worker back to the applier).
+    let ranges = token_ranges(&applying.posts.spans, pool.threads().max(2) - 1);
+    let first = std::iter::once(Work::Group(tc))
+        .chain(ranges.into_iter().map(|r| Work::Tokenize(r, Vec::new())))
+        .chain([Work::Group(rest)]);
+    let mut tokens = Vec::new();
+    for w in pool.run(first, &applying, parallel) {
+        match w {
+            Work::Tokenize(r, t) => tokens.push((r.start, t)),
+            Work::Group(x) => g.layouts.put([x]),
+            Work::Shard(_) => {}
+        }
     }
-    for h in &posts.headers {
+    tokens.sort_by_key(|t| t.0);
+    let _ = applying
+        .tokens
+        .set(tokens.into_iter().flat_map(|t| t.1).collect());
+    g.layouts.put([fts]);
+    let shards = g.layouts.fts.take_shards().into_iter().map(Work::Shard);
+    let shards = pool
+        .run(shards, &applying, parallel)
+        .into_iter()
+        .filter_map(|w| match w {
+            Work::Shard(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    g.layouts.fts.put_shards(shards);
+    for h in &applying.posts.headers {
         g.stats.add(h);
         g.keys.insert((h.project, h.trace_id, h.span_id));
     }
     g.stats.spans = g.keys.len() as u64;
 }
 
-/// Persistent threads that apply builder groups alongside the applier. A worker gets a
-/// group and the batch by value and sends the group back.
+/// A batch being applied, shared with the workers.
+struct Applying {
+    posts: Posts,
+    /// fts span id of each post, from `fts::Builder::begin`.
+    ids: fts::SpanIds,
+    /// `tokens[i]` is post `i` prepared for the fts shards, once tokenized.
+    tokens: OnceLock<Vec<fts::Prepared>>,
+}
+
+/// One independent part of applying a batch.
+enum Work {
+    /// Tokenize these posts for the fts shards.
+    Tokenize(Range<usize>, Vec<fts::Prepared>),
+    Shard(fts::Shard),
+    Group(Group),
+}
+
+impl Work {
+    fn apply(&mut self, a: &Applying) {
+        match self {
+            Work::Tokenize(r, out) => {
+                let n = fts_shards();
+                *out = a.posts.spans[r.clone()]
+                    .iter()
+                    .map(|s| fts::prepare(s, n))
+                    .collect();
+            }
+            Work::Shard(s) => {
+                let tokens = a
+                    .tokens
+                    .get()
+                    .expect("tokens are set before the shards run");
+                s.apply(tokens, &a.ids);
+            }
+            Work::Group(g) => g.apply(&a.posts.batch()),
+        }
+    }
+}
+
+/// Splits `spans` into at most `n` ranges of about equal text.
+fn token_ranges(spans: &[Span], n: usize) -> Vec<Range<usize>> {
+    let text = |s: &Span| {
+        s.inputs.as_ref().map_or(0, Vec::len) + s.outputs.as_ref().map_or(0, Vec::len) + 1
+    };
+    let total: usize = spans.iter().map(text).sum();
+    let per = total.div_ceil(n.max(1)).max(1);
+    let (mut out, mut start, mut acc) = (Vec::new(), 0, 0);
+    for (i, s) in spans.iter().enumerate() {
+        acc += text(s);
+        if acc >= per {
+            out.push(start..i + 1);
+            (start, acc) = (i + 1, 0);
+        }
+    }
+    if start < spans.len() {
+        out.push(start..spans.len());
+    }
+    out
+}
+
+/// Persistent threads that apply work items alongside the applier. A worker gets an item
+/// and the batch by value and sends the item back.
 struct Pool {
     workers: Vec<Worker>,
 }
 
 struct Worker {
-    tx: Sender<(Group, Arc<Posts>)>,
-    rx: Receiver<Group>,
+    tx: Sender<(Work, Arc<Applying>)>,
+    rx: Receiver<Work>,
 }
 
 impl Pool {
-    fn new(n: usize) -> Pool {
+    /// The applier and its workers.
+    fn threads(&self) -> usize {
+        self.workers.len() + 1
+    }
+
+    /// Enough workers for every fts shard but the applier's own, plus the other groups.
+    fn new() -> Pool {
+        let n = if cores() > 1 { fts_shards() + 1 } else { 0 };
         let workers = (0..n)
             .filter_map(|i| {
-                let (tx, work) = channel::<(Group, Arc<Posts>)>();
+                let (tx, work) = channel::<(Work, Arc<Applying>)>();
                 let (back, rx) = channel();
                 std::thread::Builder::new()
                     .name(format!("newdb-apply-{}", i + 1))
                     .spawn(move || {
-                        for (mut g, posts) in work {
-                            g.apply(&posts.batch());
-                            if back.send(g).is_err() {
+                        for (mut w, a) in work {
+                            w.apply(&a);
+                            if back.send(w).is_err() {
                                 return;
                             }
                         }
@@ -780,25 +882,29 @@ impl Pool {
         Pool { workers }
     }
 
-    /// Applies `posts` to every group, the first on this thread and the others on the
-    /// workers (or here when there are too few), and returns the groups.
-    fn run(&self, groups: impl IntoIterator<Item = Group>, posts: &Arc<Posts>) -> Vec<Group> {
-        let mut groups = groups.into_iter();
-        let mut here: Vec<Group> = groups.next().into_iter().collect();
+    /// Applies `a` with every item, the first on this thread and, when `parallel`, the
+    /// others on the workers (here when there are too few), and returns the items.
+    fn run(
+        &self,
+        work: impl IntoIterator<Item = Work>,
+        a: &Arc<Applying>,
+        parallel: bool,
+    ) -> Vec<Work> {
+        let mut work = work.into_iter();
+        let mut here: Vec<Work> = work.next().into_iter().collect();
         let mut away = Vec::new();
-        let mut workers = self.workers.iter();
-        for g in groups {
+        let mut workers = self.workers.iter().filter(|_| parallel);
+        for w in work {
             match workers.next() {
-                Some(w) => match w.tx.send((g, posts.clone())) {
-                    Ok(()) => away.push(w),
+                Some(worker) => match worker.tx.send((w, a.clone())) {
+                    Ok(()) => away.push(worker),
                     Err(e) => here.push(e.0.0),
                 },
-                None => here.push(g),
+                None => here.push(w),
             }
         }
-        let b = posts.batch();
-        here.iter_mut().for_each(|g| g.apply(&b));
-        // A worker that panicked dropped its group: the layouts cannot continue.
+        here.iter_mut().for_each(|w| w.apply(a));
+        // A worker that panicked dropped its item: the layouts cannot continue.
         here.extend(
             away.into_iter()
                 .map(|w| w.rx.recv().expect("layout worker panicked")),
@@ -1067,7 +1173,8 @@ const PARALLEL_BYTES: usize = 256 << 10;
 
 /// Hashes and compresses the payloads of `spans` on the calling thread, so concurrent
 /// ingests compress in parallel and the writer only deduplicates and appends. A large
-/// batch is split across a few scoped threads.
+/// batch is split across a few scoped threads. Tokenizing for fts waits for the applier,
+/// after the batch is acknowledged, so it is not on the caller's critical path.
 pub(crate) fn prepare(spans: &[Span]) -> Result<Vec<Prepared>> {
     let total: usize = spans.iter().map(|s| size(std::slice::from_ref(s))).sum();
     prepare_on(
