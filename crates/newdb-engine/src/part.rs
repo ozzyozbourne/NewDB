@@ -2,6 +2,7 @@
 //! its in-memory layout builders; a sealed one (`Fixed`) from its mapped layout files, or
 //! from builders replayed from its log when a layout's current version is not on disk.
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::os::unix::fs::FileExt;
@@ -360,11 +361,34 @@ pub(crate) struct Part {
     pub body: Body,
 }
 
+/// A partition's mapped layout files as `FileSet` tables, built once per query so the
+/// query's readers can borrow them. Empty for partitions answered from memory.
+pub(crate) type Tables<'a> = Vec<(&'static str, Vec<(&'a str, &'a [u8])>)>;
+
 impl Part {
-    pub fn view(&self) -> View<'_> {
+    pub fn tables(&self) -> Tables<'_> {
         match &self.body {
-            Body::Fixed(f) => View::Fixed(f),
-            Body::Live(l) => View::Live(l.read().unwrap_or_else(|e| e.into_inner())),
+            Body::Fixed(Fixed {
+                layouts: FixedLayouts::Files { sets, .. },
+                ..
+            }) => sets
+                .iter()
+                .map(|(l, set)| (*l, set.iter().map(|(n, b)| (n.as_str(), &b[..])).collect()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn view<'a>(&'a self, tables: &'a Tables<'a>) -> View<'a> {
+        let src = match &self.body {
+            Body::Fixed(f) => Src::Fixed(f, tables),
+            Body::Live(l) => Src::Live(l.read().unwrap_or_else(|e| e.into_inner())),
+        };
+        View {
+            src,
+            tc: OnceCell::new(),
+            runs: OnceCell::new(),
+            fts: OnceCell::new(),
         }
     }
 
@@ -376,69 +400,111 @@ impl Part {
     }
 }
 
-/// A read-only view of one partition for the duration of one query.
-pub(crate) enum View<'a> {
-    Fixed(&'a Fixed),
+enum Src<'a> {
+    Fixed(&'a Fixed, &'a Tables<'a>),
     Live(RwLockReadGuard<'a, Live>),
 }
 
-impl View<'_> {
+/// A read-only view of one partition for the duration of one query. Readers of sealed
+/// layout files are opened (and validated) at most once per query.
+pub(crate) struct View<'a> {
+    src: Src<'a>,
+    tc: OnceCell<trace_clustered::Reader<'a>>,
+    runs: OnceCell<runs_by_time::Reader<'a>>,
+    fts: OnceCell<fts::Reader<'a>>,
+}
+
+impl<'a> View<'a> {
     pub fn strings(&self) -> &Strings {
-        match self {
-            View::Fixed(f) => &f.strings,
-            View::Live(l) => &l.strings,
+        match &self.src {
+            Src::Fixed(f, _) => &f.strings,
+            Src::Live(l) => &l.strings,
         }
     }
 
     pub fn blob(&self) -> BlobRef<'_> {
-        match self {
-            View::Fixed(f) => f.blob.as_ref(),
-            View::Live(l) => l.blob.as_ref(),
+        match &self.src {
+            Src::Fixed(f, _) => f.blob.as_ref(),
+            Src::Live(l) => l.blob.as_ref(),
         }
     }
 
     pub fn stats(&self) -> &Stats {
-        match self {
-            View::Fixed(f) => &f.stats,
-            View::Live(l) => &l.stats,
+        match &self.src {
+            Src::Fixed(f, _) => &f.stats,
+            Src::Live(l) => &l.stats,
         }
     }
 
-    fn files(&self) -> std::result::Result<&Layouts, (&FileSets, &trace_filter::Reader)> {
-        match self {
-            View::Live(l) => Ok(&l.layouts),
-            View::Fixed(f) => match &f.layouts {
-                FixedLayouts::Memory(m) => Ok(m),
-                FixedLayouts::Files { sets, filter } => Err((sets, filter)),
+    /// The builders answering for this partition, or `None` when it has sealed files.
+    fn memory(&self) -> Option<&Layouts> {
+        match &self.src {
+            Src::Live(l) => Some(&l.layouts),
+            Src::Fixed(f, _) => match &f.layouts {
+                FixedLayouts::Memory(m) => Some(m),
+                FixedLayouts::Files { .. } => None,
             },
         }
     }
 
+    fn reader<'s, R>(
+        &'s self,
+        cell: &'s OnceCell<R>,
+        name: &str,
+        open: impl FnOnce(FileSet<'a>) -> Result<R>,
+    ) -> Result<&'s R> {
+        if let Some(r) = cell.get() {
+            return Ok(r);
+        }
+        let Src::Fixed(_, tables) = &self.src else {
+            return Err(corrupt("no layout files for an in-memory partition"));
+        };
+        let (_, files) = tables
+            .iter()
+            .find(|(n, _)| *n == name)
+            .ok_or_else(|| corrupt(format!("layout {name} is not mapped")))?;
+        let _ = cell.set(open(FileSet { files })?);
+        cell.get().ok_or_else(|| corrupt("layout reader"))
+    }
+
     pub fn may_contain(&self, t: TraceId) -> bool {
-        match self.files() {
-            Ok(m) => m.filter.may_contain(t),
-            Err((_, f)) => f.may_contain(t),
+        match (&self.src, self.memory()) {
+            (_, Some(m)) => m.filter.may_contain(t),
+            (
+                Src::Fixed(
+                    Fixed {
+                        layouts: FixedLayouts::Files { filter, .. },
+                        ..
+                    },
+                    _,
+                ),
+                None,
+            ) => filter.may_contain(t),
+            _ => true,
         }
     }
 
     /// Merged headers of `t` in this partition, all projects.
     pub fn trace(&self, t: TraceId) -> Result<(Vec<SpanHeader>, Cost)> {
-        match self.files() {
-            Ok(m) => Ok(m.tc.trace(t)),
-            Err((sets, _)) => with_files(sets, trace_clustered::NAME, |fs| {
-                let (h, c) = trace_clustered::Reader::open(fs)?.trace(t);
-                Ok((h.to_vec(), c))
-            }),
+        if let Some(m) = self.memory() {
+            return Ok(m.tc.trace(t));
         }
+        let r = self.reader(
+            &self.tc,
+            trace_clustered::NAME,
+            trace_clustered::Reader::open,
+        )?;
+        let (h, c) = r.trace(t);
+        Ok((h.to_vec(), c))
     }
 
     pub fn postings(&self, token: &[u8]) -> Result<(Vec<(TraceId, SpanId)>, Cost)> {
-        match self.files() {
-            Ok(m) => Ok(m.fts.postings(token)),
-            Err((sets, _)) => with_files(sets, fts::NAME, |fs| {
-                Ok(fts::Reader::open(fs)?.postings(token))
-            }),
+        if let Some(m) = self.memory() {
+            return Ok(m.fts.postings(token));
         }
+        Ok(self
+            .reader(&self.fts, fts::NAME, fts::Reader::open)?
+            .postings(token))
     }
 
     /// Calls `f` with run candidates newest first, starting after those with a key at or
@@ -450,32 +516,28 @@ impl View<'_> {
     ) -> Result<Cost> {
         let at_or_above = |s: &RunSummary| before.is_some_and(|b| summary_key(s) >= b);
         let mut n = 0;
-        match self.files() {
-            Ok(m) => {
-                for s in m.runs.runs_newest().skip_while(|s| at_or_above(s)) {
-                    n += 1;
-                    if !f(s)? {
-                        break;
-                    }
+        if let Some(m) = self.memory() {
+            for s in m.runs.runs_newest().skip_while(|s| at_or_above(s)) {
+                n += 1;
+                if !f(s)? {
+                    break;
                 }
-                Ok(m.runs.cost_of(n))
             }
-            Err((sets, _)) => with_files(sets, runs_by_time::NAME, |fs| {
-                let r = runs_by_time::Reader::open(fs)?;
-                let all = r.runs();
-                let from = all.partition_point(at_or_above);
-                for s in &all[from..] {
-                    n += 1;
-                    if !f(s)? {
-                        break;
-                    }
-                }
-                // Binary search touches about log2(n) summaries.
-                let mut c = r.cost_of(n);
-                c.records_visited += (usize::BITS - all.len().leading_zeros()) as u64;
-                Ok(c)
-            }),
+            return Ok(m.runs.cost_of(n));
         }
+        let r = self.reader(&self.runs, runs_by_time::NAME, runs_by_time::Reader::open)?;
+        let all = r.runs();
+        let from = all.partition_point(at_or_above);
+        for s in &all[from..] {
+            n += 1;
+            if !f(s)? {
+                break;
+            }
+        }
+        // The binary search touches about log2(n) summaries.
+        let mut c = r.cost_of(n);
+        c.records_visited += (usize::BITS - all.len().leading_zeros()) as u64;
+        Ok(c)
     }
 }
 

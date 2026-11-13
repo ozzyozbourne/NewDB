@@ -60,6 +60,15 @@ impl Encoder {
         })
     }
 
+    /// The stored form of `raw`: `Some(zstd frame)` when compressing makes it smaller,
+    /// `None` to store it raw.
+    pub fn compress(&mut self, raw: &[u8]) -> Result<Option<Vec<u8>>> {
+        if raw.len() < COMPRESS_MIN {
+            return Ok(None);
+        }
+        Ok(Some(self.zstd.compress(raw)?).filter(|c| c.len() < raw.len()))
+    }
+
     /// Appends the entry for `raw` to `out`, where `out[0]` will sit at `base` in the
     /// file, and returns its reference.
     pub fn append(
@@ -69,30 +78,38 @@ impl Encoder {
         base: u64,
         out: &mut Vec<u8>,
     ) -> Result<PayloadRef> {
-        let raw_len = u32::try_from(raw.len())
-            .map_err(|_| newdb_types::Error::InvalidInput("payload larger than 4 GiB".into()))?;
-        let compressed = if raw.len() >= COMPRESS_MIN {
-            Some(self.zstd.compress(raw)?).filter(|c| c.len() < raw.len())
-        } else {
-            None
-        };
-        let (codec, data) = match &compressed {
-            Some(c) => (codec::ZSTD, c.as_slice()),
-            None => (codec::RAW, raw),
-        };
-        let r = PayloadRef {
-            offset: base + (out.len() + ENTRY_HEADER_LEN) as u64,
-            len: data.len() as u32,
-            raw_len,
-        };
-        out.extend_from_slice(&h.to_le_bytes());
-        out.extend_from_slice(&raw_len.to_le_bytes());
-        out.extend_from_slice(&r.len.to_le_bytes());
-        out.extend_from_slice(&[codec, 0, 0, 0]);
-        out.extend_from_slice(&crc32c::crc32c(data).to_le_bytes());
-        out.extend_from_slice(data);
-        Ok(r)
+        let compressed = self.compress(raw)?;
+        append_entry(raw, compressed.as_deref(), h, base, out)
     }
+}
+
+/// Appends the entry for `raw`, whose stored form [`Encoder::compress`] returned as
+/// `compressed`, to `out`, where `out[0]` will sit at `base` in the file.
+pub fn append_entry(
+    raw: &[u8],
+    compressed: Option<&[u8]>,
+    h: Hash,
+    base: u64,
+    out: &mut Vec<u8>,
+) -> Result<PayloadRef> {
+    let raw_len = u32::try_from(raw.len())
+        .map_err(|_| newdb_types::Error::InvalidInput("payload larger than 4 GiB".into()))?;
+    let (codec, data) = match compressed {
+        Some(c) => (codec::ZSTD, c),
+        None => (codec::RAW, raw),
+    };
+    let r = PayloadRef {
+        offset: base + (out.len() + ENTRY_HEADER_LEN) as u64,
+        len: data.len() as u32,
+        raw_len,
+    };
+    out.extend_from_slice(&h.to_le_bytes());
+    out.extend_from_slice(&raw_len.to_le_bytes());
+    out.extend_from_slice(&r.len.to_le_bytes());
+    out.extend_from_slice(&[codec, 0, 0, 0]);
+    out.extend_from_slice(&crc32c::crc32c(data).to_le_bytes());
+    out.extend_from_slice(data);
+    Ok(r)
 }
 
 fn parse_entry_header(bytes: &[u8], data_offset: u64) -> Result<Entry> {

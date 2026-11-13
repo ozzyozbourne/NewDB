@@ -5,9 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use newdb_format::manifest::{self, Manifest, PartitionEntry};
 use newdb_format::{log, payload, strings as strtbl};
@@ -21,7 +21,8 @@ use crate::files::{
     remove_dir_if_exists, sync_dir, write_synced,
 };
 use crate::part::{
-    Blob, Body, Layouts, Live, Mode, Part, Stats, Strings, corrupt, open_sealed, replay,
+    Blob, Body, Layouts, Live, Mode, PAYLOAD_FIELDS, Part, Stats, Strings, corrupt, open_sealed,
+    replay,
 };
 
 pub(crate) type Ack = Sender<Result<()>>;
@@ -118,18 +119,14 @@ impl Writer {
             };
             match msg {
                 Msg::Ingest(spans, ack) => {
+                    // Group commit: take what queued up while the last batch was being
+                    // written and synced, without waiting for more. An idle writer
+                    // commits a lone request at once; `commit_interval` is only an
+                    // upper bound on the wait.
                     let mut batch = vec![(spans, ack)];
                     let mut bytes = size(&batch[0].0);
-                    let deadline = Instant::now() + self.inner.config.commit_interval;
                     while bytes < self.inner.config.commit_bytes {
-                        let wait = deadline.saturating_duration_since(Instant::now());
-                        let next = if wait.is_zero() {
-                            rx.try_recv().map_err(|e| e == TryRecvError::Disconnected)
-                        } else {
-                            rx.recv_timeout(wait)
-                                .map_err(|e| e == RecvTimeoutError::Disconnected)
-                        };
-                        match next {
+                        match rx.try_recv() {
                             Ok(Msg::Ingest(s, a)) => {
                                 bytes += size(&s);
                                 batch.push((s, a));
@@ -304,17 +301,14 @@ impl Writer {
             new_strings: Strings::default(),
             new_dedup: HashMap::new(),
         };
-        let mut headers = Vec::with_capacity(spans.len());
         let mut spans = spans;
-        {
-            let g = live.read().unwrap_or_else(|e| e.into_inner());
-            for (i, span) in spans.iter_mut().enumerate() {
-                span.version = self.next_version + i as u64;
-                let h = enc.header(span, &g.strings, &a.dedup, &a.pay, &mut self.enc)?;
-                log::append_post(&mut enc.log, &h);
-                headers.push(h);
-            }
+        for (i, span) in spans.iter_mut().enumerate() {
+            span.version = self.next_version + i as u64;
         }
+        let headers = {
+            let g = live.read().unwrap_or_else(|e| e.into_inner());
+            enc.encode(&spans, &g.strings, &a.dedup, &a.pay, &mut self.enc)?
+        };
         let sync = self.inner.config.fsync;
         let written = (|| -> Result<()> {
             // Payloads first, so a durable log record never points at missing payloads.
@@ -600,44 +594,86 @@ impl Encoding {
         id
     }
 
-    fn payload(
-        &mut self,
+    /// The stored copy of `raw` in the committed part of the payload file, if any.
+    fn committed(
+        &self,
         raw: &[u8],
+        h: payload::Hash,
         committed: &HashMap<payload::Hash, Vec<PayloadRef>>,
         file: &File,
-        enc: &mut payload::Encoder,
-    ) -> Result<PayloadRef> {
-        let h = payload::hash(raw);
-        let known = committed.get(&h).into_iter().chain(self.new_dedup.get(&h));
-        for &r in known.flatten() {
-            if r.raw_len as usize != raw.len() {
-                continue;
-            }
+    ) -> Result<Option<PayloadRef>> {
+        for &r in committed.get(&h).into_iter().flatten() {
             // Confirm the hash hit by comparing bytes.
-            let stored = if r.offset >= self.pay_base {
-                let start = (r.offset - self.pay_base) as usize - payload::ENTRY_HEADER_LEN;
-                let end = (r.offset - self.pay_base) as usize + r.len as usize;
-                payload::decode(&self.pay[start..end], r)?
-            } else {
-                crate::part::BlobRef::File(file, self.pay_base).read(r)?
-            };
-            if stored == raw {
-                return Ok(r);
+            if r.raw_len as usize == raw.len()
+                && crate::part::BlobRef::File(file, self.pay_base).read(r)? == raw
+            {
+                return Ok(Some(r));
             }
         }
-        let r = enc.append(raw, h, self.pay_base, &mut self.pay)?;
-        self.new_dedup.entry(h).or_default().push(r);
-        Ok(r)
+        Ok(None)
     }
 
-    fn header(
+    /// Encodes a batch: string records and payload entries, then one post record per
+    /// span. Payloads are deduplicated against the partition and within the batch first,
+    /// then the new ones are compressed and appended.
+    fn encode(
         &mut self,
-        s: &Span,
+        spans: &[Span],
         table: &Strings,
         committed: &HashMap<payload::Hash, Vec<PayloadRef>>,
         file: &File,
         enc: &mut payload::Encoder,
-    ) -> Result<SpanHeader> {
+    ) -> Result<Vec<SpanHeader>> {
+        let mut headers: Vec<SpanHeader> = spans.iter().map(|s| self.scalars(s, table)).collect();
+        // Every payload of the batch: (span, field), and where its stored copy comes from.
+        let mut jobs: Vec<(usize, u32, Src)> = Vec::new();
+        let mut fresh: Vec<(&[u8], payload::Hash)> = Vec::new();
+        let mut by_hash: HashMap<payload::Hash, Vec<usize>> = HashMap::new();
+        for (i, s) in spans.iter().enumerate() {
+            for bit in PAYLOAD_FIELDS {
+                let Some(raw) = payload_field(s, bit) else {
+                    continue;
+                };
+                let h = payload::hash(raw);
+                if let Some(r) = self.committed(raw, h, committed, file)? {
+                    jobs.push((i, bit, Src::Stored(r)));
+                    continue;
+                }
+                let same = by_hash.entry(h).or_default();
+                let k = match same.iter().find(|&&k| fresh[k].0 == raw) {
+                    Some(&k) => k,
+                    None => {
+                        same.push(fresh.len());
+                        fresh.push((raw, h));
+                        fresh.len() - 1
+                    }
+                };
+                jobs.push((i, bit, Src::Fresh(k)));
+            }
+        }
+        let mut refs = Vec::with_capacity(fresh.len());
+        for (raw, h) in &fresh {
+            let r = enc.append(raw, *h, self.pay_base, &mut self.pay)?;
+            self.new_dedup.entry(*h).or_default().push(r);
+            refs.push(r);
+        }
+        for (i, bit, r) in jobs {
+            let r = match r {
+                Src::Stored(r) => r,
+                Src::Fresh(k) => refs[k],
+            };
+            let h = &mut headers[i];
+            h.fields |= bit;
+            *payload_slot(h, bit) = r;
+        }
+        for h in &headers {
+            log::append_post(&mut self.log, h);
+        }
+        Ok(headers)
+    }
+
+    /// The header of `s` without its payload references.
+    fn scalars(&mut self, s: &Span, table: &Strings) -> SpanHeader {
         let mut h = SpanHeader {
             trace_id: s.trace_id,
             span_id: s.span_id,
@@ -678,19 +714,33 @@ impl Encoding {
                 *slot = self.string(v, table);
             }
         }
-        for (bit, v, slot) in [
-            (INPUTS, s.inputs.as_deref(), &mut h.inputs),
-            (OUTPUTS, s.outputs.as_deref(), &mut h.outputs),
-            (ATTRIBUTES, s.attributes.as_deref(), &mut h.attributes),
-            (EVENTS, s.events.as_deref(), &mut h.events),
-            (ERROR, s.error.as_deref().map(str::as_bytes), &mut h.error),
-        ] {
-            if let Some(v) = v {
-                f |= bit;
-                *slot = self.payload(v, committed, file, enc)?;
-            }
-        }
         h.fields = f;
-        Ok(h)
+        h
+    }
+}
+
+/// Where a batch's payload is stored: an existing entry, or the `k`-th new one.
+enum Src {
+    Stored(PayloadRef),
+    Fresh(usize),
+}
+
+fn payload_field(s: &Span, bit: u32) -> Option<&[u8]> {
+    match bit {
+        INPUTS => s.inputs.as_deref(),
+        OUTPUTS => s.outputs.as_deref(),
+        ATTRIBUTES => s.attributes.as_deref(),
+        EVENTS => s.events.as_deref(),
+        _ => s.error.as_deref().map(str::as_bytes),
+    }
+}
+
+fn payload_slot(h: &mut SpanHeader, bit: u32) -> &mut PayloadRef {
+    match bit {
+        INPUTS => &mut h.inputs,
+        OUTPUTS => &mut h.outputs,
+        ATTRIBUTES => &mut h.attributes,
+        EVENTS => &mut h.events,
+        _ => &mut h.error,
     }
 }

@@ -559,3 +559,107 @@ fn kill_9_loses_no_acknowledged_post() {
     oracle.ingest(posts[..recovered as usize].to_vec()).unwrap();
     queries_agree(&oracle, &db, &posts[..recovered as usize]);
 }
+
+#[test]
+fn default_workload_with_large_payloads_matches_the_oracle() {
+    let dir = TestDir::new("default");
+    let posts = generate(&GenConfig {
+        large_payload_rate: 0.01,
+        ..GenConfig::default()
+    });
+    check(&posts, 64, &Driver::new(dir.path(), 4, 0, 9));
+}
+
+/// Writers on several threads and readers alongside them. Each writer owns its traces, so
+/// the merged spans equal the oracle's except for `version`, which depends on interleaving.
+#[test]
+fn concurrent_writers_and_readers() {
+    let dir = TestDir::new("concurrent");
+    let clock = Arc::new(ManualClock::new(GenConfig::default().base_ns));
+    let db = Db::open(
+        dir.path(),
+        Config {
+            commit_interval: Duration::from_millis(2),
+            ..config(&clock)
+        },
+    )
+    .unwrap();
+    let streams: Vec<Vec<Span>> = (0..4)
+        .map(|s| generate(&GenConfig::small(100 + s)))
+        .collect();
+    std::thread::scope(|sc| {
+        for posts in &streams {
+            let db = &db;
+            sc.spawn(move || {
+                for (i, c) in posts.chunks(7).enumerate() {
+                    db.ingest(c.to_vec()).unwrap();
+                    if i % 10 == 9 {
+                        db.seal_active().unwrap();
+                    }
+                }
+            });
+        }
+        for _ in 0..2 {
+            sc.spawn(|| {
+                for _ in 0..50 {
+                    let runs = db.runs(&RunQuery {
+                        limit: 20,
+                        ..Default::default()
+                    });
+                    assert!(
+                        runs.unwrap()
+                            .value
+                            .windows(2)
+                            .all(|w| w[0].key() > w[1].key())
+                    );
+                }
+            });
+        }
+    });
+    let oracle = Oracle::new();
+    let all: Vec<Span> = streams.concat();
+    oracle.ingest(all.clone()).unwrap();
+    let (tq, rq, sq) = standard_queries(&all);
+    let unversioned = |mut v: Vec<Span>| {
+        v.iter_mut().for_each(|s| s.version = 0);
+        v
+    };
+    for q in &tq {
+        assert_eq!(
+            unversioned(oracle.trace(q).unwrap().value),
+            unversioned(db.trace(q).unwrap().value)
+        );
+    }
+    for q in &rq {
+        assert_eq!(oracle.runs(q).unwrap().value, db.runs(q).unwrap().value);
+    }
+    for q in &sq {
+        assert_eq!(oracle.search(q).unwrap().value, db.search(q).unwrap().value);
+    }
+    assert!(db.verify().unwrap().problems.is_empty());
+}
+
+#[test]
+fn an_idle_writer_commits_at_once() {
+    let dir = TestDir::new("idle");
+    let clock = Arc::new(ManualClock::new(HOUR_NS));
+    let db = Db::open(
+        dir.path(),
+        Config {
+            commit_interval: Duration::from_millis(500),
+            ..config(&clock)
+        },
+    )
+    .unwrap();
+    db.ingest(vec![post(1, 1)]).unwrap();
+    let t = std::time::Instant::now();
+    for s in 2..12 {
+        db.ingest(vec![post(1, s)]).unwrap();
+    }
+    // Ten sequential ingests take far less than one commit_interval.
+    assert!(
+        t.elapsed() < Duration::from_millis(250),
+        "{:?}",
+        t.elapsed()
+    );
+}

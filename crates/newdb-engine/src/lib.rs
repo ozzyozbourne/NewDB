@@ -340,7 +340,8 @@ impl Db {
     fn read<T>(&self, op: &'static str, f: impl FnOnce(&[View<'_>]) -> Result<T>) -> Result<T> {
         let t0 = Instant::now();
         let parts = self.inner.parts();
-        let views: Vec<View<'_>> = parts.iter().map(|p| p.view()).collect();
+        let tables: Vec<_> = parts.iter().map(|p| p.tables()).collect();
+        let views: Vec<View<'_>> = parts.iter().zip(&tables).map(|(p, t)| p.view(t)).collect();
         let r = f(&views);
         drop(views);
         self.inner.record(op, t0.elapsed());
@@ -403,7 +404,8 @@ impl Drop for Db {
 }
 
 fn info(p: &Part) -> PartitionInfo {
-    let v = p.view();
+    let tables = Vec::new();
+    let v = p.view(&tables);
     let st = v.stats();
     let layouts = match &p.body {
         Body::Fixed(f) => f
