@@ -10,19 +10,19 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use newdb_format::manifest::{self, Manifest, PartitionEntry};
-use newdb_format::{log, payload, strings as strtbl};
+use newdb_format::{log, overlap, payload, strings as strtbl};
 use newdb_layouts::{Batch, LAYOUTS, LayoutDef, LayoutFiles};
 use newdb_types::header::field::*;
-use newdb_types::{Error, PayloadRef, Result, Span, SpanHeader};
+use newdb_types::{Error, PayloadRef, Result, Span, SpanHeader, TraceId};
 
 use crate::Inner;
 use crate::files::{
-    self, HOUR_NS, LAYOUTS_DIR, LOG, PAYLOADS, STRINGS, TRASH, layout_dir_name,
+    self, HOUR_NS, LAYOUTS_DIR, LOG, OVERLAP, PAYLOADS, STRINGS, TRASH, layout_dir_name,
     remove_dir_if_exists, sync_dir, write_synced,
 };
 use crate::part::{
     Blob, Body, Layouts, Live, Mode, PAYLOAD_FIELDS, Part, Stats, Strings, corrupt, open_sealed,
-    replay,
+    present, replay,
 };
 
 pub(crate) type Ack = Sender<Result<()>>;
@@ -246,7 +246,14 @@ impl Writer {
             .read(true)
             .write(true)
             .open(dir.join(PAYLOADS))?;
+        let mut traces: Vec<TraceId> = r.keys.iter().map(|k| k.1).collect();
+        traces.sort_unstable();
+        traces.dedup();
+        let overlap = present(&self.inner.parts(), &traces)?;
+        self.inner.add_multi(&overlap);
         let live = Live {
+            traces: traces.into_iter().collect(),
+            overlap,
             strings: r.strings,
             blob: Blob::File {
                 file: File::open(dir.join(PAYLOADS))?,
@@ -305,9 +312,17 @@ impl Writer {
         for (i, span) in spans.iter_mut().enumerate() {
             span.version = self.next_version + i as u64;
         }
-        let headers = {
+        let (headers, new_traces) = {
             let g = live.read().unwrap_or_else(|e| e.into_inner());
-            enc.encode(&spans, &g.strings, &a.dedup, &a.pay, &mut self.enc)?
+            let headers = enc.encode(&spans, &g.strings, &a.dedup, &a.pay, &mut self.enc)?;
+            let mut new: Vec<TraceId> = headers
+                .iter()
+                .map(|h| h.trace_id)
+                .filter(|t| !g.traces.contains(t))
+                .collect();
+            new.sort_unstable();
+            new.dedup();
+            (headers, new)
         };
         let sync = self.inner.config.fsync;
         let written = (|| -> Result<()> {
@@ -327,12 +342,25 @@ impl Writer {
             let _ = a.pay.set_len(a.pay_len);
             return Err(e);
         }
+        // Traces that sealed partitions share are marked before the batch is visible, so
+        // a read that sees the batch also sees the mark.
+        let id = a.part.id;
+        let sealed: Vec<_> = self
+            .inner
+            .parts()
+            .into_iter()
+            .filter(|p| p.id != id)
+            .collect();
+        let shared = present(&sealed, &new_traces)?;
+        self.inner.add_multi(&shared);
         a.log_len += enc.log.len() as u64;
         a.pay_len += enc.pay.len() as u64;
         for (h, refs) in enc.new_dedup {
             a.dedup.entry(h).or_default().extend(refs);
         }
         let mut g = live.write().unwrap_or_else(|e| e.into_inner());
+        g.traces.extend(new_traces);
+        g.overlap.extend(shared);
         for s in enc.new_strings.list {
             g.strings.push(s);
         }
@@ -379,6 +407,9 @@ impl Writer {
                 write_layout(&dir, def, &files)?;
             }
             write_synced(&dir.join(STRINGS), &strtbl::encode(&g.strings.list))?;
+            let mut shared = g.overlap.clone();
+            shared.sort_unstable();
+            write_synced(&dir.join(OVERLAP), &overlap::encode(&shared))?;
             sync_dir(&dir)?;
             entry(&a.part, &g.stats)
         };

@@ -4,15 +4,15 @@
 
 use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::time::Instant;
 
-use newdb_layouts::Cost;
+use newdb_layouts::{Cost, fts};
 use newdb_types::header::field::{END, ERROR, INPUTS, MODEL, NAME, OUTPUTS, PARENT, SESSION};
 use newdb_types::text::tokens;
 use newdb_types::{
     Read, ReadStats, Result, Run, RunKey, RunQuery, RunSummary, RunType, SearchHit, SearchQuery,
-    Span, SpanHeader, SpanId, Status, TraceId, TraceQuery,
+    Span, SpanHeader, Status, TraceId, TraceQuery,
 };
 
 use crate::part::{
@@ -153,13 +153,16 @@ pub(crate) fn trace(views: &[View<'_>], q: &TraceQuery) -> Result<Read<Vec<Span>
 /// its run candidates newest first by the start time it saw. A run is taken only from its
 /// owner partition (see [`Merged::owner`]), where that start time is the true one, so the
 /// walk can stop as soon as a candidate is older than the `limit`-th result.
-pub(crate) fn runs(views: &[View<'_>], q: &RunQuery) -> Result<Read<Vec<Run>>> {
+pub(crate) fn runs(
+    views: &[View<'_>],
+    multi: &HashSet<TraceId>,
+    q: &RunQuery,
+) -> Result<Read<Vec<Run>>> {
     let mut ph = Phases::new(q.timings);
     let mut st = ReadStats::default();
     // Ascending by (key, project): the first entry is the oldest kept.
     let mut best: BTreeMap<(RunKey, String), Run> = BTreeMap::new();
     let mut cache: HashMap<TraceId, Vec<Merged>> = HashMap::new();
-    let mut multis: HashMap<TraceId, bool> = HashMap::new();
     let mut order: Vec<usize> = (0..views.len()).collect();
     order.sort_by_key(|&i| Reverse(views[i].stats().max_start()));
     let floor = |best: &BTreeMap<(RunKey, String), Run>| -> Option<RunKey> {
@@ -192,7 +195,7 @@ pub(crate) fn runs(views: &[View<'_>], q: &RunQuery) -> Result<Read<Vec<Run>>> {
             }
             // A run whose trace has no posts in another partition is complete here: filter
             // on its summary, and build the Run (strings) only for those that pass.
-            if !multi(views, pi, s.trace_id, &mut multis, &mut st)? {
+            if !multi.contains(&s.trace_id) {
                 if !may_match(q, s) {
                     return Ok(true);
                 }
@@ -229,33 +232,6 @@ pub(crate) fn runs(views: &[View<'_>], q: &RunQuery) -> Result<Read<Vec<Run>>> {
     }
     ph.mark("scan");
     Ok(done(best.into_values().rev().collect(), st, ph))
-}
-
-/// Whether trace `t` has posts in a partition other than `pi` (cached per query). The
-/// in-memory filters rule out most partitions; a filter hit is confirmed by a lookup.
-fn multi(
-    views: &[View<'_>],
-    pi: usize,
-    t: TraceId,
-    cache: &mut HashMap<TraceId, bool>,
-    st: &mut ReadStats,
-) -> Result<bool> {
-    if let Some(&m) = cache.get(&t) {
-        return Ok(m);
-    }
-    let mut m = false;
-    for (j, w) in views.iter().enumerate() {
-        if j != pi && w.may_contain(t) {
-            let (h, cost) = w.trace(t)?;
-            add_cost(st, cost);
-            if !h.is_empty() {
-                m = true;
-                break;
-            }
-        }
-    }
-    cache.insert(t, m);
-    Ok(m)
 }
 
 /// The numeric filters of `q` on a summary, without building the run. Only rejects runs
@@ -312,151 +288,171 @@ fn summary_run(v: &View<'_>, s: &RunSummary) -> Result<Option<Run>> {
     }))
 }
 
-/// A search candidate: a span complete in one partition (`Local`, its merged header
-/// there), or a span merged across partitions (`Merged`, index into the loaded traces).
-enum Cand {
-    Local(usize, SpanHeader),
-    Merged(usize, usize),
-}
-
-/// Newest-first search, exact. A span whose trace lives in one partition matches only if
-/// that partition's postings hold every token, so it comes from the per-partition
-/// intersection and is keyed and confirmed from that partition alone. A span of a trace
-/// with posts in several partitions can match with its tokens split across them, so it
-/// becomes a candidate when any partition lists it for any token, and is merged. All
-/// candidates are sorted by key, then confirmed against the merged `inputs` and `outputs`
-/// until `limit`.
-pub(crate) fn search(views: &[View<'_>], q: &SearchQuery) -> Result<Read<Vec<SearchHit>>> {
+/// Newest-first search, exact, stopping at `limit`.
+///
+/// A span of a trace that lives in one partition matches only if that partition's
+/// postings hold every token, and its start there is its true start: such spans come
+/// from each partition's `intersect_newest` stream. Spans of traces spread over several
+/// partitions (the engine's `multi` set) can have their tokens split across partitions
+/// and their start set elsewhere, so they are merged across partitions first and form one
+/// more stream, sorted by merged key. A heap merges the streams newest first; partitions
+/// open in order of their newest start, only once they could hold the next hit. Each
+/// candidate is confirmed against its merged `inputs` and `outputs`.
+pub(crate) fn search(
+    views: &[View<'_>],
+    multi: &HashSet<TraceId>,
+    q: &SearchQuery,
+) -> Result<Read<Vec<SearchHit>>> {
     let mut ph = Phases::new(q.timings);
     let mut st = ReadStats::default();
     let want = tokens(q.text.as_bytes());
     if want.is_empty() || q.limit == 0 {
         return Ok(done(Vec::new(), st, ph));
     }
-    let mut multis = HashMap::new();
-    let mut spread: HashSet<(TraceId, SpanId)> = HashSet::new();
-    let mut keyed: Vec<(Reverse<(RunKey, &str)>, Cand)> = Vec::new();
-    for (pi, v) in views.iter().enumerate() {
-        let pid = match &q.project {
-            Some(p) => match v.strings().id(p) {
-                Some(id) => Some(id),
-                None => continue,
-            },
-            None => None,
-        };
-        st.partitions_touched += 1;
-        // Every (trace, span) listed for a query token here, sorted, one entry per token.
-        let mut listed: Vec<(TraceId, SpanId)> = Vec::new();
-        for tok in &want {
-            let (ps, cost) = v.postings(tok)?;
-            add_cost(&mut st, cost);
-            listed.extend(ps);
-        }
-        listed.sort_unstable();
-        let mut at = 0;
-        while at < listed.len() {
-            let t = listed[at].0;
-            let mut spans = Vec::new();
-            while at < listed.len() && listed[at].0 == t {
-                let s = listed[at].1;
-                let n = listed[at..]
-                    .iter()
-                    .take_while(|x| x.1 == s && x.0 == t)
-                    .count();
-                spans.push((s, n == want.len()));
-                at += n;
-            }
-            if multi(views, pi, t, &mut multis, &mut st)? {
-                spread.extend(spans.iter().map(|(s, _)| (t, *s)));
-                continue;
-            }
-            if !spans.iter().any(|(_, all)| *all) {
-                continue;
-            }
-            let (headers, cost) = v.trace(t)?;
-            add_cost(&mut st, cost);
-            for h in headers {
-                let full = spans.iter().any(|(s, all)| *all && *s == h.span_id);
-                if full && pid.is_none_or(|id| h.project == id) {
-                    let project = v
-                        .strings()
-                        .get(h.project)
-                        .ok_or_else(|| corrupt("project is not in the partition"))?;
-                    let key = RunKey {
-                        start_ns: h.start_ns,
-                        trace_id: t,
-                        span_id: h.span_id,
-                    };
-                    keyed.push((Reverse((key, project)), Cand::Local(pi, h)));
-                }
-            }
-        }
-    }
-    ph.mark("postings");
+    let toks: Vec<&[u8]> = want.iter().map(Vec::as_slice).collect();
 
-    let mut traces: Vec<TraceId> = spread.iter().map(|(t, _)| *t).collect();
+    // Spans of spread traces, merged, newest first (popped from the back).
+    let mut spread: Vec<(RunKey, Merged)> = Vec::new();
+    let mut traces: Vec<TraceId> = multi.iter().copied().collect();
     traces.sort_unstable();
-    traces.dedup();
-    let mut loaded = Vec::with_capacity(traces.len());
     for t in traces {
-        loaded.push(load_trace(views, t, q.project.as_deref(), &mut st)?);
-    }
-    for (ti, merged) in loaded.iter().enumerate() {
-        for (j, m) in merged.iter().enumerate() {
-            let (t, s) = (m.span.trace_id, m.span.span_id);
-            if spread.contains(&(t, s)) {
+        for m in load_trace(views, t, q.project.as_deref(), &mut st)? {
+            if m.pieces
+                .iter()
+                .any(|(_, h)| h.has(INPUTS) || h.has(OUTPUTS))
+            {
                 let key = RunKey {
                     start_ns: m.span.start_ns.unwrap_or(0),
                     trace_id: t,
-                    span_id: s,
+                    span_id: m.span.span_id,
                 };
-                keyed.push((Reverse((key, m.span.project.as_str())), Cand::Merged(ti, j)));
+                spread.push((key, m));
             }
         }
     }
-    keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    ph.mark("candidates");
+    spread.sort_unstable_by(|a, b| (a.0, &a.1.span.project).cmp(&(b.0, &b.1.span.project)));
+    ph.mark("spread");
 
+    let mut order: Vec<usize> = (0..views.len())
+        .filter(|&i| {
+            q.project
+                .as_ref()
+                .is_none_or(|p| views[i].strings().id(p).is_some())
+        })
+        .collect();
+    order.sort_by_key(|&i| Reverse(views[i].stats().max_start()));
+    let mut opened = 0;
+    let mut streams: Vec<(usize, Box<dyn Iterator<Item = fts::Hit> + '_>)> = Vec::new();
+    // (key, stream index); usize::MAX is the spread stream.
+    let mut heap: BinaryHeap<(RunKey, usize)> = BinaryHeap::new();
+    if let Some((k, _)) = spread.last() {
+        heap.push((*k, usize::MAX));
+    }
+    let key = |(start_ns, trace_id, span_id): fts::Hit| RunKey {
+        start_ns,
+        trace_id,
+        span_id,
+    };
+    let mut headers: HashMap<(usize, TraceId), Vec<SpanHeader>> = HashMap::new();
     let mut hits = Vec::new();
-    for (Reverse((key, project)), cand) in &keyed {
-        let (inputs, outputs) = match cand {
-            Cand::Local(pi, h) => {
-                let b = views[*pi].blob();
+    'outer: loop {
+        while opened < order.len()
+            && heap
+                .peek()
+                .is_none_or(|(k, _)| k.start_ns <= views[order[opened]].stats().max_start())
+        {
+            let pi = order[opened];
+            opened += 1;
+            st.partitions_touched += 1;
+            let (mut it, cost) = views[pi].intersect_newest(&toks)?;
+            add_cost(&mut st, cost);
+            if let Some(h) = it.next() {
+                heap.push((key(h), streams.len()));
+                streams.push((pi, it));
+            }
+        }
+        let Some((k, src)) = heap.pop() else {
+            break;
+        };
+        st.records_visited += 1;
+        if src == usize::MAX {
+            let Some((_, mut m)) = spread.pop() else {
+                break;
+            };
+            if let Some((k2, _)) = spread.last() {
+                heap.push((*k2, usize::MAX));
+            }
+            load_payloads(views, &mut m, INPUTS | OUTPUTS, &mut st)?;
+            if matches(&want, m.span.inputs.as_deref(), m.span.outputs.as_deref()) {
+                hits.push(hit(&m.span.project, k));
+            }
+        } else {
+            let (pi, it) = &mut streams[src];
+            let pi = *pi;
+            if let Some(h) = it.next() {
+                heap.push((key(h), src));
+            }
+            if multi.contains(&k.trace_id) {
+                continue;
+            }
+            let v = &views[pi];
+            let pid = q.project.as_ref().and_then(|p| v.strings().id(p));
+            if let Entry::Vacant(e) = headers.entry((pi, k.trace_id)) {
+                let (hs, cost) = v.trace(k.trace_id)?;
+                add_cost(&mut st, cost);
+                e.insert(hs);
+            }
+            for h in &headers[&(pi, k.trace_id)] {
+                if h.span_id != k.span_id || pid.is_some_and(|id| h.project != id) {
+                    continue;
+                }
                 let mut read = |bit: u32| -> Result<Option<Vec<u8>>> {
                     if !h.has(bit) {
                         return Ok(None);
                     }
-                    let bytes = b.read(payload_ref(h, bit))?;
+                    let bytes = v.blob().read(payload_ref(h, bit))?;
                     st.payload_bytes_decompressed += bytes.len() as u64;
                     Ok(Some(bytes))
                 };
-                (read(INPUTS)?, read(OUTPUTS)?)
-            }
-            Cand::Merged(ti, j) => {
-                let mut m = Merged {
-                    span: loaded[*ti][*j].span.clone(),
-                    pieces: loaded[*ti][*j].pieces.clone(),
-                    owner: 0,
-                    owner_has_start: false,
-                };
-                load_payloads(views, &mut m, INPUTS | OUTPUTS, &mut st)?;
-                (m.span.inputs, m.span.outputs)
-            }
-        };
-        let mut have = tokens(inputs.as_deref().unwrap_or_default());
-        have.extend(tokens(outputs.as_deref().unwrap_or_default()));
-        if want.iter().all(|w| have.contains(w)) {
-            hits.push(SearchHit {
-                project: project.to_string(),
-                trace_id: key.trace_id,
-                span_id: key.span_id,
-                start_ns: key.start_ns,
-            });
-            if hits.len() == q.limit {
-                break;
+                let (i, o) = (read(INPUTS)?, read(OUTPUTS)?);
+                if matches(&want, i.as_deref(), o.as_deref()) {
+                    let project = v
+                        .strings()
+                        .get(h.project)
+                        .ok_or_else(|| corrupt("project is not in the partition"))?;
+                    hits.push(hit(
+                        project,
+                        RunKey {
+                            start_ns: h.start_ns,
+                            ..k
+                        },
+                    ));
+                    if hits.len() == q.limit {
+                        break 'outer;
+                    }
+                }
             }
         }
+        if hits.len() >= q.limit {
+            break;
+        }
     }
-    ph.mark("confirm");
+    hits.truncate(q.limit);
+    ph.mark("streams");
     Ok(done(hits, st, ph))
+}
+
+fn matches(want: &[Vec<u8>], inputs: Option<&[u8]>, outputs: Option<&[u8]>) -> bool {
+    let mut have = tokens(inputs.unwrap_or_default());
+    have.extend(tokens(outputs.unwrap_or_default()));
+    want.iter().all(|w| have.contains(w))
+}
+
+fn hit(project: &str, k: RunKey) -> SearchHit {
+    SearchHit {
+        project: project.to_string(),
+        trace_id: k.trace_id,
+        span_id: k.span_id,
+        start_ns: k.start_ns,
+    }
 }

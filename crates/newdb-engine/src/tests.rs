@@ -267,8 +267,33 @@ fn cross_partition_cases() {
         name: Some("no start".into()),
         ..post(4, 1)
     }]);
+    // Search tokens only in an earlier partition while a later one moves the start, and
+    // tokens split between an open and a close post that both carry the start.
+    both(vec![
+        Span {
+            start_ns: Some(5),
+            inputs: Some(b"\"refund shipping\"".to_vec()),
+            ..post(5, 1)
+        },
+        Span {
+            start_ns: Some(7),
+            inputs: Some(b"\"refund\"".to_vec()),
+            ..post(6, 1)
+        },
+    ]);
+    both(vec![
+        Span {
+            start_ns: Some(10_000),
+            ..post(5, 1)
+        },
+        Span {
+            start_ns: Some(7),
+            outputs: Some(b"\"shipping\"".to_vec()),
+            ..post(6, 1)
+        },
+    ]);
     let mut posts = Vec::new();
-    for t in 1..=4 {
+    for t in 1..=6 {
         posts.push(post(t, 1));
     }
     queries_agree(&oracle, &d, &posts);
@@ -276,18 +301,26 @@ fn cross_partition_cases() {
         limit: 10,
         ..RunQuery::default()
     });
-    assert_eq!(runs.unwrap().value.len(), 4);
-    for text in ["refund", "shipping", "done", "shipping done"] {
-        let q = SearchQuery {
-            text: text.into(),
-            limit: 10,
-            ..Default::default()
-        };
-        assert_eq!(
-            oracle.search(&q).unwrap().value,
-            d.search(&q).unwrap().value,
-            "{text}"
-        );
+    assert_eq!(runs.unwrap().value.len(), 6);
+    for text in [
+        "refund",
+        "shipping",
+        "done",
+        "shipping done",
+        "refund shipping",
+    ] {
+        for limit in [1, 2, 10] {
+            let q = SearchQuery {
+                text: text.into(),
+                limit,
+                ..Default::default()
+            };
+            assert_eq!(
+                oracle.search(&q).unwrap().value,
+                d.search(&q).unwrap().value,
+                "{text} limit {limit}"
+            );
+        }
     }
     d.reopen(false);
     queries_agree(&oracle, &d, &posts);
