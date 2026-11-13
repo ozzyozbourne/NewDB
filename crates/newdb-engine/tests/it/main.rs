@@ -4,8 +4,9 @@
 //!
 //! - [`pagination`]: `runs` pages with `before` across partitions whose start-time ranges
 //!   overlap, with filters, return every run exactly once.
-//! - [`randomized`]: 2,000 traces, batch sizes 1..=500, random clock jumps, `seal_active`
-//!   and reopens (`NEWDB_IT_SEED` reruns one seed).
+//! - [`randomized`]: 2,000 traces (500 in debug builds), batch sizes 1..=500, random clock
+//!   jumps, `seal_active` and reopens (`NEWDB_IT_SEED` reruns one seed, `NEWDB_IT_TRACES`
+//!   sets the trace count).
 //! - [`concurrent`]: readers during ingest and sealing see some prefix state, never older
 //!   than one they saw before.
 //! - [`seal_crash`]: a crash between layout writes and the MANIFEST update, simulated

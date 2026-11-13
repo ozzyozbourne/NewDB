@@ -1,8 +1,10 @@
-//! A large randomized differential run: 2,000 traces ingested in batches of 1..=500 posts,
+//! A large randomized differential run: 2,000 traces (500 in debug builds, to keep
+//! `scripts/check` fast) ingested in batches of 1..=500 posts (scaled with the trace count),
 //! with random clock jumps, `seal_active` calls and reopens (some read-only first),
 //! checked against the oracle along the way and at the end.
 //!
-//! Set `NEWDB_IT_SEED` to rerun one seed; a failure message names the seed and step.
+//! Set `NEWDB_IT_SEED` to rerun one seed and `NEWDB_IT_TRACES` to change the trace count;
+//! a failure message names the seed and step.
 
 use newdb_testkit::Oracle;
 use newdb_testkit::diff::standard_queries;
@@ -10,6 +12,14 @@ use newdb_testkit::r#gen::{GenConfig, Rng, generate};
 use newdb_types::{Error, Span, Store};
 
 use crate::common::*;
+
+fn traces() -> usize {
+    match std::env::var("NEWDB_IT_TRACES") {
+        Ok(s) => s.parse().expect("NEWDB_IT_TRACES must be a number"),
+        Err(_) if cfg!(debug_assertions) => 500,
+        Err(_) => 2000,
+    }
+}
 
 fn seeds() -> Vec<u64> {
     match std::env::var("NEWDB_IT_SEED") {
@@ -56,10 +66,14 @@ fn light_check(expected: &dyn Store, actual: &dyn Store, posts: &[Span], what: &
 
 #[test]
 fn randomized_clock_jumps_seals_and_reopens_match_oracle() {
+    let traces = traces();
+    // Batches of 1..=500 posts at 2,000 traces, scaled down with the trace count so every
+    // size takes about as many steps (clock jumps, seals, reopens).
+    let max_batch = (500 * traces as u64 / 2000).max(1);
     for seed in seeds() {
         let posts = generate(&GenConfig {
             seed,
-            traces: 2000,
+            traces,
             projects: 3,
             max_spans_per_trace: 20,
             payload_median: 64,
@@ -78,7 +92,7 @@ fn randomized_clock_jumps_seals_and_reopens_match_oracle() {
         let mut events = Vec::new();
         while done < posts.len() {
             step += 1;
-            let n = (1 + rng.below(500) as usize).min(posts.len() - done);
+            let n = (1 + rng.below(max_batch) as usize).min(posts.len() - done);
             let batch = posts[done..done + n].to_vec();
             oracle.ingest(batch.clone()).unwrap();
             db.as_ref().unwrap().ingest(batch).expect("ingest");
