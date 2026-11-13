@@ -69,6 +69,16 @@ type ReadFn<'a> = Box<dyn Fn() -> Result<()> + 'a>;
 /// for "refund policy". Allocation counts are the median per read and are reported only
 /// when [`CountingAlloc`] is the global allocator.
 pub fn run_bench(store: &dyn Store, config: &BenchConfig) -> Result<BenchReport> {
+    run_bench_with(store, config, &mut || Ok(()))
+}
+
+/// [`run_bench`], calling `after_ingest` between the ingest and the reads, untimed. The CLI
+/// seals the engine's active partition there, so the reads walk sealed, mapped files.
+pub fn run_bench_with(
+    store: &dyn Store,
+    config: &BenchConfig,
+    after_ingest: &mut dyn FnMut() -> Result<()>,
+) -> Result<BenchReport> {
     let posts = generate(&config.workload);
     let total = posts.len() as u64;
 
@@ -102,6 +112,7 @@ pub fn run_bench(store: &dyn Store, config: &BenchConfig) -> Result<BenchReport>
     }
     let ingest_secs = t0.elapsed().as_secs_f64();
     let counting = CountingAlloc::count() > allocs_before_ingest;
+    after_ingest()?;
 
     let trace = |payloads: bool| TraceQuery {
         project: project.clone(),
@@ -680,6 +691,22 @@ mod tests {
         // the trace, so that read allocates.
         assert_eq!(report.allocations.len(), report.reads.len());
         assert!(report.allocations[0].1 > 0);
+    }
+
+    #[test]
+    fn after_ingest_runs_once_between_the_ingest_and_the_reads() {
+        let oracle = Oracle::new();
+        let cfg = small();
+        let mut seen = Vec::new();
+        run_bench_with(&oracle, &cfg, &mut || {
+            seen.push(oracle.len());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0] > 0, "the workload was ingested first");
+        let fail = run_bench_with(&Oracle::new(), &cfg, &mut || Err(Error::ReadOnly));
+        assert!(matches!(fail, Err(Error::ReadOnly)));
     }
 
     #[test]

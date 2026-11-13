@@ -13,6 +13,8 @@ tokio = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
+prost = { workspace = true }
+flate2 = { workspace = true }
 
 [dev-dependencies]
 newdb-testkit = { workspace = true }
