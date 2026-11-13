@@ -329,6 +329,8 @@ Agreed on 2026-11-13:
 5. **No grace period** before sealing.
 6. **Read stats:** counters always on, timings on request, allocation counts in bench builds.
 7. **TypeScript after Python.**
+8. **`ingest` stays durable when it returns.** The ≥ 100k posts/s target is met with several concurrent callers; one caller with fsync on reaches about 70k.
+9. **The warm trace-load target is checked on a developer laptop** (2.4 ms on an Apple M4). On the 4-core hyperthreaded orb it is about 7 ms, bound by zstd.
 
 ## References
 
