@@ -5,6 +5,7 @@
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
+use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
@@ -284,8 +285,8 @@ impl Layouts {
 /// Where a partition's payload bytes are read from.
 pub(crate) enum Blob {
     Map(Bytes),
-    /// A sealed partition's `payloads.sealed`, validated when opened.
-    Sealed(Bytes, sealed::Layout),
+    /// A sealed partition's `payloads.sealed`.
+    Sealed(SealedBlob),
     /// The active partition's file, of which the first `len` bytes are committed.
     File {
         file: File,
@@ -297,7 +298,82 @@ pub(crate) enum Blob {
 pub(crate) enum BlobRef<'a> {
     Slice(&'a [u8]),
     File(&'a File, u64),
-    Sealed(sealed::Sealed<'a>),
+    Sealed(SealedRef<'a>),
+}
+
+/// A sealed partition's `payloads.sealed`. Opening checks only its fixed header. The
+/// tables (megabytes per partition) are validated the first time a query reads a payload
+/// from the partition, so opening a database does not walk the tables of every retained
+/// partition. A table that fails validation is `Error::Corrupt` on every read that needs
+/// it; `verify` checks all of them.
+pub(crate) struct SealedBlob {
+    bytes: Bytes,
+    path: PathBuf,
+    layout: OnceLock<sealed::Layout>,
+}
+
+impl SealedBlob {
+    fn open(path: PathBuf, bytes: Bytes) -> Result<SealedBlob> {
+        let head = &bytes[..sealed::HEADER_LEN.min(bytes.len())];
+        if sealed::Sealed::tables_end(head)? > bytes.len() {
+            return Err(corrupt("payloads.sealed: truncated tables"));
+        }
+        Ok(SealedBlob {
+            bytes,
+            path,
+            layout: OnceLock::new(),
+        })
+    }
+
+    /// The validated view. Threads that race to validate each do the work once; the
+    /// file is immutable, so they agree.
+    pub fn get(&self) -> Result<sealed::Sealed<'_>> {
+        let layout = match self.layout.get() {
+            Some(l) => *l,
+            None => {
+                let l = self.check()?;
+                *self.layout.get_or_init(|| l)
+            }
+        };
+        sealed::Sealed::with_layout(&self.bytes, layout)
+    }
+
+    fn check(&self) -> Result<sealed::Layout> {
+        let len = self.bytes.len();
+        let head = &self.bytes[..sealed::HEADER_LEN.min(len)];
+        let end = sealed::Sealed::tables_end(head)?.min(len);
+        // Validate the tables from a plain read: validating through the mapping would
+        // keep all of them resident for good. A snapshot can outlive its partition's
+        // directory (retention), and then the mapping is all there is.
+        match File::open(&self.path) {
+            Ok(f) => {
+                let mut prefix = Vec::with_capacity(end);
+                f.take(end as u64).read_to_end(&mut prefix)?;
+                sealed::Sealed::check_tables(&prefix, len as u64)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                sealed::Sealed::check_tables(&self.bytes[..end], len as u64)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// A sealed partition's payloads as a query sees them: already validated (replay), or
+/// validated when first needed.
+#[derive(Clone, Copy)]
+pub(crate) enum SealedRef<'a> {
+    Checked(sealed::Sealed<'a>),
+    Lazy(&'a SealedBlob),
+}
+
+impl<'a> SealedRef<'a> {
+    pub fn get(self) -> Result<sealed::Sealed<'a>> {
+        match self {
+            SealedRef::Checked(s) => Ok(s),
+            SealedRef::Lazy(b) => b.get(),
+        }
+    }
 }
 
 impl Blob {
@@ -305,11 +381,7 @@ impl Blob {
         match self {
             Blob::Map(b) => BlobRef::Slice(b),
             Blob::File { file, len } => BlobRef::File(file, *len),
-            // The layout came from opening these same immutable bytes.
-            Blob::Sealed(b, l) => match sealed::Sealed::with_layout(b, *l) {
-                Ok(s) => BlobRef::Sealed(s),
-                Err(_) => BlobRef::Slice(&[]),
-            },
+            Blob::Sealed(s) => BlobRef::Sealed(SealedRef::Lazy(s)),
         }
     }
 }
@@ -320,6 +392,7 @@ impl<'a> BlobRef<'a> {
         let BlobRef::Sealed(s) = *self else {
             return Ok(None);
         };
+        let s = s.get()?;
         match s.find(r.offset) {
             Some(loc) if loc.len == r.raw_len => Ok(Some((s, loc))),
             _ => Err(corrupt(format!(
@@ -334,8 +407,8 @@ impl<'a> BlobRef<'a> {
     pub fn read(&self, r: PayloadRef) -> Result<Vec<u8>> {
         match *self {
             BlobRef::Slice(b) => payload::read(b, r),
-            BlobRef::Sealed(s) => match self.locate(r)? {
-                Some((_, loc)) => {
+            BlobRef::Sealed(_) => match self.locate(r)? {
+                Some((s, loc)) => {
                     let raw = s.decompress(loc.frame as usize)?;
                     Ok(sealed::Sealed::get(&raw, loc)?.to_vec())
                 }
@@ -778,7 +851,7 @@ pub(crate) fn replay(dir: &Path, mode: Mode, sink: &mut dyn FnMut(&Batch<'_>)) -
             if mode == Mode::Verify {
                 s.verify()?;
             }
-            (&[][..], BlobRef::Sealed(s))
+            (&[][..], BlobRef::Sealed(SealedRef::Checked(s)))
         }
         None => {
             let mut scan = payload::Scan::new(&pay_bytes)?;
@@ -1042,16 +1115,8 @@ fn payload_files(dir: &Path) -> Result<(Option<Bytes>, Bytes)> {
 fn open_payloads(dir: &Path) -> Result<Blob> {
     match payload_files(dir)? {
         (Some(b), _) => {
-            // Validate the tables from a plain read: validating through the mapping
-            // would keep all of them resident (megabytes per partition) for good.
-            let f = File::open(dir.join(SEALED_PAYLOADS))?;
-            let mut head = vec![0; sealed::HEADER_LEN.min(b.len())];
-            f.read_exact_at(&mut head, 0)?;
-            let end = sealed::Sealed::tables_end(&head)?.min(b.len());
-            let mut prefix = vec![0; end];
-            f.read_exact_at(&mut prefix, 0)?;
-            let layout = sealed::Sealed::check_tables(&prefix, b.len() as u64)?;
-            Ok(Blob::Sealed(b, layout))
+            let s = SealedBlob::open(dir.join(SEALED_PAYLOADS), b)?;
+            Ok(Blob::Sealed(s))
         }
         (None, blob) => {
             payload::check_header(&blob)?;

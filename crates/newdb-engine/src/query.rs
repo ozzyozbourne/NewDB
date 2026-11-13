@@ -305,6 +305,7 @@ fn fill_range(blobs: &[BlobRef<'_>], spans: &mut [Merged], mask: u32) -> Result<
         let BlobRef::Sealed(s) = blobs[pi] else {
             continue;
         };
+        let s = s.get()?;
         if at.0 != pi {
             at = (pi, 0);
         }
@@ -326,6 +327,7 @@ fn fill_range(blobs: &[BlobRef<'_>], spans: &mut [Merged], mask: u32) -> Result<
         let BlobRef::Sealed(s) = blobs[run[0].0] else {
             continue;
         };
+        let s = s.get()?;
         s.decompress_into(run[0].1 as usize, &mut buf)?;
         for (k, &(_, _, loc, i, bit)) in run.iter().enumerate() {
             let whole = loc.at == 0 && loc.len as usize == buf.len();

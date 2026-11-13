@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use newdb_format::sealed::Loc;
+use newdb_format::sealed::{Loc, Sealed};
 use newdb_types::header::field::{
     COMPLETION_TOKENS, COST, END, ERROR, MODEL, NAME, PARENT, PROMPT_TOKENS, PROVIDER, RUN_TYPE,
     SESSION, START, STATUS,
@@ -219,13 +219,18 @@ pub(crate) fn with_trace(
     let mut frames_needed: Vec<(usize, u32)> = Vec::new();
     let mut located: Vec<(usize, u32, Loc, usize, usize)> = Vec::with_capacity(lookups.len());
     let mut cursor = (usize::MAX, 0usize);
+    // The validated payload tables of each partition this trace reads frames from.
+    let mut sealed: Vec<Option<Sealed<'_>>> = vec![None; blobs.len()];
     for &(vi, offset, si, k, r) in &lookups {
-        let BlobRef::Sealed(s) = blobs[vi] else {
-            continue;
-        };
         if cursor.0 != vi {
             cursor = (vi, 0);
+            if let BlobRef::Sealed(s) = blobs[vi] {
+                sealed[vi] = Some(s.get()?);
+            }
         }
+        let Some(s) = sealed[vi] else {
+            continue;
+        };
         let (next, loc) = s.find_from(cursor.1, offset);
         cursor.1 = next;
         match loc {
@@ -249,16 +254,13 @@ pub(crate) fn with_trace(
     // Decompress each needed frame once; large traces on the read pool, in contiguous
     // runs of about equal raw bytes.
     let frame_raw = |&(vi, fr): &(usize, u32)| -> u64 {
-        match blobs[vi] {
-            BlobRef::Sealed(s) => s.frame(fr as usize).raw_len as u64,
-            _ => 0,
-        }
+        sealed[vi].map_or(0, |s| s.frame(fr as usize).raw_len as u64)
     };
     let decode = |run: &[(usize, u32)]| -> Result<Vec<Vec<u8>>> {
         run.iter()
-            .map(|&(vi, fr)| match blobs[vi] {
-                BlobRef::Sealed(s) => s.decompress(fr as usize),
-                _ => Err(corrupt("payloads.sealed: lookup")),
+            .map(|&(vi, fr)| match sealed[vi] {
+                Some(s) => s.decompress(fr as usize),
+                None => Err(corrupt("payloads.sealed: lookup")),
             })
             .collect()
     };
@@ -293,7 +295,7 @@ pub(crate) fn with_trace(
         for (k, place) in places.iter().enumerate() {
             let bytes: &[u8] = match *place {
                 Bytes::None => continue,
-                Bytes::Frame(fi, loc) => newdb_format::sealed::Sealed::get(&frames[fi], loc)?,
+                Bytes::Frame(fi, loc) => Sealed::get(&frames[fi], loc)?,
                 Bytes::Owned(oi) => &owned[oi],
             };
             stats.payload_bytes_decompressed += bytes.len() as u64;

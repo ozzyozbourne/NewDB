@@ -875,4 +875,37 @@ fn sealed_payloads_replace_the_blob_through_crashes() {
         "{:?}",
         report.problems
     );
+
+    // Damaged payload tables: the tables are validated on the first payload read of
+    // the partition, not at open. The database opens, reads without payloads still
+    // answer, and a read that needs the partition's payloads is Corrupt, not a panic.
+    let mut bytes = std::fs::read(&file).unwrap();
+    bytes[newdb_format::sealed::HEADER_LEN + 1] ^= 0x40;
+    std::fs::write(&file, bytes).unwrap();
+    d.reopen(true);
+    let mut corrupt = 0;
+    for s in &posts {
+        let q = TraceQuery {
+            project: s.project.clone(),
+            trace_id: s.trace_id,
+            payloads: false,
+            timings: false,
+        };
+        d.with(|db| db.trace(&q)).unwrap();
+        let with = TraceQuery {
+            payloads: true,
+            ..q
+        };
+        for _ in 0..2 {
+            match d.with(|db| db.trace(&with)) {
+                Ok(_) => {}
+                Err(newdb_types::Error::Corrupt(m)) => {
+                    assert!(m.contains("payloads.sealed"), "{m}");
+                    corrupt += 1;
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+    }
+    assert!(corrupt > 0 && corrupt % 2 == 0);
 }

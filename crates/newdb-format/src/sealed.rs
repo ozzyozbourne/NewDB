@@ -251,12 +251,14 @@ pub fn write<W: Write + Seek>(
     Ok(())
 }
 
+#[inline]
 fn le32(b: &[u8], at: usize) -> u32 {
     let mut v = [0; 4];
     v.copy_from_slice(&b[at..at + 4]);
     u32::from_le_bytes(v)
 }
 
+#[inline]
 fn le64(b: &[u8], at: usize) -> u64 {
     let mut v = [0; 8];
     v.copy_from_slice(&b[at..at + 8]);
@@ -327,26 +329,27 @@ impl<'a> Sealed<'a> {
             data_start,
             file_len,
         };
-        let s = Sealed {
-            bytes: prefix,
-            layout,
-        };
+        // One pass over each table as fixed-size records. `tables_end` computed
+        // `data_start` from the two counts, so the slices are exactly the tables.
+        let frames_end = TABLES_AT + layout.frames * FRAME_LEN;
+        let (frames, _) = prefix[TABLES_AT..frames_end].as_chunks::<FRAME_LEN>();
+        let (entries, _) = prefix[frames_end..data_start].as_chunks::<ENTRY_LEN>();
         let mut next = 0u64;
-        for i in 0..layout.frames {
-            let f = s.frame(i);
-            if f.offset != next || f.codec > codec::ZSTD as u32 {
+        for f in frames {
+            if le64(f, 0) != next || le32(f, 20) > codec::ZSTD as u32 {
                 return Err(corrupt("payloads.sealed: bad frame table"));
             }
-            next += f.len as u64;
+            next += le32(f, 8) as u64;
         }
         if data_start as u64 + next != file_len {
             return Err(corrupt("payloads.sealed: frame data length"));
         }
         let mut last = None;
-        for i in 0..layout.entries {
-            let (off, l) = s.entry(i);
-            let fits = (l.frame as usize) < layout.frames
-                && l.at as u64 + l.len as u64 <= s.frame(l.frame as usize).raw_len as u64;
+        for e in entries {
+            let (off, frame, at, len) = (le64(e, 0), le32(e, 8), le32(e, 12), le32(e, 16));
+            let fits = frames
+                .get(frame as usize)
+                .is_some_and(|f| at as u64 + len as u64 <= le32(f, 12) as u64);
             if !fits || last.is_some_and(|p| p >= off) {
                 return Err(corrupt("payloads.sealed: bad entry table"));
             }
@@ -381,6 +384,7 @@ impl<'a> Sealed<'a> {
     }
 
     /// Frame `i` (`i < frame_count()`).
+    #[inline]
     pub fn frame(&self, i: usize) -> Frame {
         let at = TABLES_AT + i * FRAME_LEN;
         let b = self.bytes;
@@ -394,6 +398,7 @@ impl<'a> Sealed<'a> {
     }
 
     /// Entry `i` (`i < entry_count()`): `(blob offset, location)`.
+    #[inline]
     pub fn entry(&self, i: usize) -> (u64, Loc) {
         let at = TABLES_AT + self.layout.frames * FRAME_LEN + i * ENTRY_LEN;
         let b = self.bytes;
